@@ -16,12 +16,19 @@
 * (http://creativecommons.org/licenses/by-nc-sa/4.0/).
 */
 
+
+
 var fetchSamples= function (e) {
 	// it seems that it is necessary to keep this explicit reference to the event-handler
 	// in order to pervent the dumbshit Chrome GC from detroying it eventually
 	
 	var f= window.player['genSamples'].bind(window.player); // need to re-bind the instance.. after all this 
 															// joke language has no real concept of OO	
+	f(e);
+};
+
+var calcTick= function (e) {
+	var f= window.player['tick'].bind(window.player);
 	f(e);
 };
 
@@ -63,6 +70,37 @@ function extend(base, sub, methods) {
   }
   return sub;
 }
+
+/*
+* Subclass this class in order to sync/associate stuff with the audio playback. 
+* 
+* If a respective subclass is specified upon instanciation of the ScriptNodePlayer, then the player will track 
+* playback progress as 'ticks' (one 'tick' typically measuring 256 audio samples). "Ticks" are measured within the
+* context of the current playback buffer and whenever a new buffer is played the counting restarts from 0.
+*
+* During playback (e.g. from some "animation frame" handler) the current playback position can be queried using 
+* ScriptNodePlayer.getInstance().getCurrentTick().
+*
+* The idea is for the AbstractTicker to provide additional "tick resolution" data that can be queried using the 
+* "current tick". During playback the original audio buffers are fed to the AbstractTicker before they are played 
+* (see 'calcTickData'). This allows the AbstractTicker to build/update its "tick resolution" data.
+*/
+AbstractTicker = function() {}
+AbstractTicker.prototype = {
+	/*
+	* Constructor that allows the AbstractTicker to setup its own data structures (the 
+	* number of 'tick' events associated with each sample buffer is: samplesPerBuffer/tickerStepWidth).
+	* @samplesPerBuffer number of audio samples in the original playback buffers - that the AbstractTicker can use to 
+	*                   derive its additional data streams from
+	* @tickerStepWidth  number of audio samples that are played between "tick events"
+	*/
+	init: function(samplesPerBuffer, tickerStepWidth) {},
+	/*
+	* Invoked with each audio buffer before it is played.
+	*/
+	calcTickData: function(output1, output2) {}
+};
+
 
 var SAMPLES_PER_BUFFER = 8192;// allowed: buffer sizes: 256, 512, 1024, 2048, 4096, 8192, 16384
 
@@ -269,22 +307,22 @@ AudioBackendAdapterBase.prototype = {
 		return len;	
 	},
 	getResampledAudio: function(buffer, len) {	
+		var resampleLen;
 		if (this._sampleRate == this._inputSampleRate) {		
-			var ret= this.getCopiedAudio(buffer, len);
-			return ret;
+			resampleLen= this.getCopiedAudio(buffer, len);
 		} else {
-			var resampleLen= Math.round(len * this._sampleRate / this._inputSampleRate);	
+			resampleLen= Math.round(len * this._sampleRate / this._inputSampleRate);	
 			var bufSize= resampleLen * this._channels;	// for each of the x channels
 			
-			if (bufSize > this._resampleBuffer.length) { this._resampleBuffer= new this.allocResampleBuffer(bufSize); }
+			if (bufSize > this._resampleBuffer.length) { this._resampleBuffer= this.allocResampleBuffer(bufSize); }
 			
 			// only mono and interleaved stereo data is currently implemented..
 			this.resampleChannel(0, buffer, len, resampleLen);
 			if (this._channels == 2) {
 				this.resampleChannel(1, buffer, len, resampleLen);
 			}
-			return resampleLen;
 		}
+		return resampleLen;
 	},
 	resampleChannel: function(channelId, buffer, len, resampleLen) {
 		// Bresenham algorithm based resampling
@@ -312,6 +350,7 @@ AudioBackendAdapterBase.prototype = {
 		return this._resampleBuffer;
 	}
 };
+
 
 /*
 * Emscripten based backends that produce 16-bit sample data.
@@ -468,8 +507,10 @@ FileCache.prototype = {
 *       ScriptNodePlayer.getInstance();
 */
 var ScriptNodePlayer = (function () {
-	PlayerImpl = function(backendAdapter, basePath, requiredFiles, spectrumEnabled, onPlayerReady, onTrackReadyToPlay, onTrackEnd, onUpdate) {
-	
+	/*
+	* @param externalTicker must be a subclass of AbstractTicker
+	*/
+	PlayerImpl = function(backendAdapter, basePath, requiredFiles, spectrumEnabled, onPlayerReady, onTrackReadyToPlay, onTrackEnd, onUpdate, externalTicker) {
 		if(typeof backendAdapter === 'undefined')		{ alert("fatal error: backendAdapter not specified"); }
 		if(typeof onPlayerReady === 'undefined')		{ alert("fatal error: onPlayerReady not specified"); }
 		if(typeof onTrackReadyToPlay === 'undefined')	{ alert("fatal error: onTrackReadyToPlay not specified"); }
@@ -492,6 +533,15 @@ var ScriptNodePlayer = (function () {
 		this._onTrackEnd= onTrackEnd;
 		this._onPlayerReady= onPlayerReady;
 		this._onUpdate= onUpdate;	// optional
+		
+		
+		// "external ticker" allows to sync separately maintained data with the actual audio playback
+		this._tickerStepWidth= 256;		// shortest available (i.e. tick every 256 samples)
+		if(typeof externalTicker !== 'undefined') {
+			externalTicker.init(SAMPLES_PER_BUFFER, this._tickerStepWidth);
+		}
+	    this._externalTicker = externalTicker;
+		this._currentTick= 0;
 		
 		
 		// audio buffer handling
@@ -602,6 +652,16 @@ var ScriptNodePlayer = (function () {
 			if ((!this.isWaitingForFile()) && (!this._initInProgress) && this._isSongReady) {
 				this._isPaused= false;
 			}
+		},
+				
+		/*
+		* gets the index of the 'tick' that is currently playing.
+		* allows to sync separately stored data with the audio playback.
+		*/
+		getCurrentTick: function() {
+			var idx= Math.ceil(SAMPLES_PER_BUFFER/this._tickerStepWidth)-1;			
+			idx= Math.min(idx, this._currentTick)
+			return idx;
 		},
 		
 		/*
@@ -873,6 +933,12 @@ var ScriptNodePlayer = (function () {
 				this._gainNode = window._gPlayerAudioCtx.createGain();	
 				
 				this._scriptNode.connect(this._gainNode);				
+
+				// optional add-on
+				if (typeof this._externalTicker !== 'undefined') {
+					var tickerScriptNode= this.createTickerScriptProcessor(window._gPlayerAudioCtx);
+					tickerScriptNode.connect(this._gainNode);
+				}
 				if (this._spectrumEnabled) {
 					this._gainNode.connect(this._analyzerNode);
 					this._analyzerNode.connect(window._gPlayerAudioCtx.destination);
@@ -916,6 +982,21 @@ var ScriptNodePlayer = (function () {
 			var scriptNode = audioCtx.createScriptProcessor(SAMPLES_PER_BUFFER, 0, this._backendAdapter.getChannels());	
 			scriptNode.onaudioprocess = fetchSamples;
 		//	scriptNode.onaudioprocess = player.generateSamples.bind(player);	// doesn't work with dumbshit Chrome GC
+			return scriptNode;
+		},
+		createTickerScriptProcessor: function(audioCtx) {
+			var scriptNode;
+			// "ticker" uses shortest buffer length available so that onaudioprocess
+			// is invoked more frequently than the above scriptProcessor.. it is the purpose
+			// of the "ticker" to supply data that is used for an "animation frame" (e.g. to display a VU meter), 
+			// i.e. accuracy is not a big issue since we are talking about 60fps.. (at 48000kHz the 256 sample 
+			// buffer would work up to 187.5 fps.. only people using unusually high playback rates might touch the limit..)
+			
+			// this script processor does not actually produce any audible output.. it just provides a callback
+			// that is synchronized with the actual music playback.. (the alternative would be to manually try and 
+			// keep track of the playback progress..)
+			scriptNode = audioCtx.createScriptProcessor(256, 0, 1);	
+			scriptNode.onaudioprocess = calcTick;
 			return scriptNode;
 		},
 		fillEmpty: function(outSize, output1, output2) {
@@ -1040,6 +1121,9 @@ var ScriptNodePlayer = (function () {
 				oReq.send(null);
 			}
 			return -1;	
+		},
+		tick: function(event) {
+			this._currentTick++;
 		},		
 		// called for 'onaudioprocess' to feed new batch of sample data
 		genSamples: function(event) {		
@@ -1093,11 +1177,10 @@ var ScriptNodePlayer = (function () {
 								
 								// note: this code will also be hit if additional load is triggered 
 								// from the playback, i.e. exclude that case
-								this._isPaused= true;
-								
 								if (this._onTrackEnd) {
 									this._onTrackEnd();
 								}
+								this._isPaused= true;
 								return;							
 							}
 						}
@@ -1119,7 +1202,11 @@ var ScriptNodePlayer = (function () {
 				}
 				
 				this._currentPlaytime+= outSize;	// keep track how long we are playing
-			}	
+			}
+			if (typeof this._externalTicker !== 'undefined') {
+				this._externalTicker.calcTickData(output1, output2);
+				this._currentTick= 0;
+			}
 		},
 		copySamplesStereo: function(resampleBuffer, output1, output2, outSize) {
 			var i;
@@ -1182,7 +1269,7 @@ var ScriptNodePlayer = (function () {
 
     return {
 	    createInstance: function(backendAdapter, basePath, requiredFiles, enableSpectrum,
-								onPlayerReady, onTrackReadyToPlay, onTrackEnd, doOnUpdate) {
+								onPlayerReady, onTrackReadyToPlay, onTrackEnd, doOnUpdate, externalTicker) {
 					
 			var trace= false;
 			if (typeof window.player != 'undefined' ) {			// stop existing pipeline
@@ -1199,7 +1286,7 @@ var ScriptNodePlayer = (function () {
 				trace= old._traceSwitch;
 			}
 			var p = new PlayerImpl(backendAdapter, basePath, requiredFiles, enableSpectrum,
-								onPlayerReady, onTrackReadyToPlay, onTrackEnd, doOnUpdate);
+								onPlayerReady, onTrackReadyToPlay, onTrackEnd, doOnUpdate, externalTicker);
 			p._traceSwitch= trace;
 		},
         getInstance: function () {
