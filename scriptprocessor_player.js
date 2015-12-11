@@ -98,7 +98,12 @@ AbstractTicker.prototype = {
 	/*
 	* Invoked with each audio buffer before it is played.
 	*/
-	calcTickData: function(output1, output2) {}
+	calcTickData: function(output1, output2) {},
+	
+	/*
+	* Gets called each time the computeAudioSamples() has been invoked.
+	*/
+	computeAudioSamplesNotify: function() {}
 };
 
 
@@ -158,7 +163,7 @@ AudioBackendAdapterBase.prototype = {
 	* The subclass can either use the 'data' directly or us the 'filename' to retrieve it indirectly 
 	* (e.g. when regular file I/O APIs are used).
 	*/
-	loadMusicData: function(sampleRate, path, filename, data) {this.error("loadMusicData");},
+	loadMusicData: function(sampleRate, path, filename, data, options) {this.error("loadMusicData");},
 	
 	/**
 	* Second step towards playback: Select specific sub-song from the loaded song file.
@@ -866,7 +871,7 @@ var ScriptNodePlayer = (function () {
 			return this._correctSampleRate;
 		},		
 		initIfNeeded: function (fullFilename, data, options) {
-			var status= this.loadMusicData(fullFilename, data);
+			var status= this.loadMusicData(fullFilename, data, options);
 			if (status <0) {
 				this._isSongReady= false;
 				this.setWaitingForFile(true);
@@ -951,7 +956,7 @@ var ScriptNodePlayer = (function () {
 			this._songInfo= {};
 			this._backendAdapter.updateSongInfo(fullFilename, this._songInfo);
 		},			
-		loadMusicData: function(fullFilename, arrayBuffer) {
+		loadMusicData: function(fullFilename, arrayBuffer, options) {
 			this._backendAdapter.teardown();
 
 			if (arrayBuffer) {
@@ -959,7 +964,7 @@ var ScriptNodePlayer = (function () {
 				
 				var data= new Uint8Array(arrayBuffer);
 				this._backendAdapter.registerFileData(pfn, data);	// in case the backend "needs" to retrieve the file by name 
-				var ret= this._backendAdapter.loadMusicData(this._sampleRate, pfn[0], pfn[1], data);
+				var ret= this._backendAdapter.loadMusicData(this._sampleRate, pfn[0], pfn[1], data, options);
 
 				if (ret === 0) {			
 					this.resetBuffer();
@@ -1153,6 +1158,9 @@ var ScriptNodePlayer = (function () {
 							status= 1;
 						} else {
 							status = this._backendAdapter.computeAudioSamples();
+							if (typeof this._externalTicker !== 'undefined') {
+								this._externalTicker.computeAudioSamplesNotify();
+							}
 						}
 										
 						if (status !== 0) {
