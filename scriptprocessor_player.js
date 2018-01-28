@@ -8,9 +8,9 @@
 *
 * <p>AudioBackendAdapterBase: an abstract base class for specific backend (i.e. 'sample data producer') integration.
 *
-* version 1.0
+*	version 1.01 (with WASM support)
 *
-* 	Copyright (C) 2015 Juergen Wothke
+* 	Copyright (C) 2017 Juergen Wothke
 *
 * Terms of Use: This software is licensed under a CC BY-NC-SA 
 * (http://creativecommons.org/licenses/by-nc-sa/4.0/).
@@ -34,11 +34,18 @@ var calcTick= function (e) {
 
 var setGlobalWebAudioCtx= function() {
 	if (typeof window._gPlayerAudioCtx == 'undefined') {	// cannot be instantiated 2x (so make it global)
-		try {
-			window.AudioContext = window.AudioContext||window.webkitAudioContext;
-			window._gPlayerAudioCtx = new AudioContext();
+		
+		var errText= 'Web Audio API is not supported in this browser';
+		try {			
+			if('AudioContext' in window) {
+				window._gPlayerAudioCtx = new AudioContext();
+			} else if('webkitAudioContext' in window) {
+				window._gPlayerAudioCtx = new webkitAudioContext();		// legacy stuff
+			} else {
+				alert(errText + e);
+			}
 		} catch(e) {
-			alert('Web Audio API is not supported in this browser (get Chrome 18 or Firefox 26)' + e);
+			alert(errText + e);
 		}
 	}		
 }
@@ -145,7 +152,7 @@ AudioBackendAdapterBase = function (channels, bytesPerSample) {
 	this._sampleRate= 44100;
 	this._inputSampleRate= 44100;
 	this._observer;
-	this._manualSetupComplete= true;	// override if necessary	
+	this._manualSetupComplete= true;	// override if necessary
 };
 
 AudioBackendAdapterBase.prototype = {
@@ -217,7 +224,7 @@ AudioBackendAdapterBase.prototype = {
 	},
 	
 // ************* optional: setup related
-
+	
 	/*
 	* Allows to perform some file input based manual setup sequence (e.g. setting some BIOS).
 	* return 0: step successful & init completed, -1: error, 1: step successful
@@ -366,6 +373,14 @@ EmsHEAP16BackendAdapter = (function(){ var $this = function (backend, channels) 
 		if (!window.Math.fround) { window.Math.fround = window.Math.round; } // < Chrome 38 hack
 	}; 
 	extend(AudioBackendAdapterBase, $this, {
+		/* async emscripten init means that adapter may not immediately be ready - see async WASM compilation */
+		isAdapterReady: function() { 
+			if (typeof this.Module.notReady === "undefined")	return true; // default for backward compatibility		
+			return !this.Module.notReady;
+		},		
+		notifyAdapterReady: function() {
+			if (typeof this._observer !== "undefined" )	this._observer.notify();	
+		},
 		registerEmscriptenFileData: function(pathFilenameArray, data) {
 			// create a virtual emscripten FS for all the songs that are touched.. so the compiled code will
 			// always find what it is looking for.. some players will look to additional resource files in the same folder..
@@ -596,7 +611,7 @@ var ScriptNodePlayer = (function () {
 		var f= window.player['preloadFiles'].bind(window.player);
 		f(requiredFiles, function() {
 			this._preLoadReady= true;
-			if (this._preLoadReady && this._backendAdapter.isManualSetupComplete()) {
+			if (this._preLoadReady && this._backendAdapter.isAdapterReady() && this._backendAdapter.isManualSetupComplete()) {
 				this._isPlayerReady= true;
 				this._onPlayerReady();
 			}
@@ -607,6 +622,12 @@ var ScriptNodePlayer = (function () {
 	PlayerImpl.prototype = {
 	
 // ******* general
+		notify: function() {	// used to handle asynchronously initialized backend impls
+			if (this._preLoadReady && this._backendAdapter.isAdapterReady() && this._backendAdapter.isManualSetupComplete()) {
+				this._isPlayerReady= true;
+				this._onPlayerReady();
+			}			
+		},
 
 		/**
 		* Is the player ready for use? (i.e. initialization completed)
@@ -649,7 +670,10 @@ var ScriptNodePlayer = (function () {
 				this._isPaused= true;
 			}
 		},
-		
+		isPaused: function() {		
+			return this._isPaused;
+		},
+
 		/*
 		* resume audio playback
 		*/
@@ -673,7 +697,9 @@ var ScriptNodePlayer = (function () {
 		* set the playback volume (input between 0 and 1)
 		*/
 		setVolume: function(value) {
-			this._gainNode.gain.value= value;
+			if (typeof this._gainNode != 'undefined') { 
+				this._gainNode.gain.value= value;
+			}
 		},
 		
 		/*
@@ -705,6 +731,20 @@ var ScriptNodePlayer = (function () {
 		setPlaybackTimeout: function(t) {			
 			this._currentPlaytime= 0;
 			this._currentTimeout= t/1000*this._sampleRate;
+		},
+		/*
+		* Timeout in seconds.
+		*/
+		getPlaybackTimeout: function(t) {
+			if (this._currentTimeout < 0) {
+				return -1;
+			} else {
+				return Math.round(this._currentTimeout/this._sampleRate);
+			}
+		},
+
+		getCurrentPlaytime: function() {
+			return Math.round(this._currentPlaytime/this._sampleRate);
 		},
 		
 // ******* access to frequency spectrum data (if enabled upon construction)
@@ -878,7 +918,7 @@ var ScriptNodePlayer = (function () {
 				this._initInProgress= false;
 			
 			} else if (status === 0) {
-				this.isPaused= false;
+			//	this._isPaused= false;
 				this.setWaitingForFile(false);
 				this._isSongReady= true;
 				this._currentPlaytime= 0;
@@ -921,9 +961,9 @@ var ScriptNodePlayer = (function () {
 				return true;
 			}
 			return false;
-		},		
+		},	
 		handleBackendEvent: function() {					
-			if(this._backendAdapter.isManualSetupComplete() && this._preLoadReady) {
+			if(this._backendAdapter.isAdapterReady() && this._backendAdapter.isManualSetupComplete() && this._preLoadReady) {
 				this._isPlayerReady= true;
 				this._onPlayerReady();
 			}
@@ -1187,8 +1227,10 @@ var ScriptNodePlayer = (function () {
 								// from the playback, i.e. exclude that case
 								if (this._onTrackEnd) {
 									this._onTrackEnd();
+								} else {
+									// FIXME regression test
+									this._isPaused= true;
 								}
-								this._isPaused= true;
 								return;							
 							}
 						}
