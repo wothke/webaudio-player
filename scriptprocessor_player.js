@@ -8,7 +8,7 @@
 *
 * <p>AudioBackendAdapterBase: an abstract base class for specific backend (i.e. 'sample data producer') integration.
 *
-*	version 1.01 (with WASM support)
+*	version 1.02 (with WASM support)
 *
 * 	Copyright (C) 2017 Juergen Wothke
 *
@@ -224,7 +224,13 @@ AudioBackendAdapterBase.prototype = {
 	},
 	
 // ************* optional: setup related
-	
+	/*
+	* Implement if subclass needs additional setup logic.
+	*/
+	isAdapterReady: function() {
+		return true;
+	},		
+
 	/*
 	* Allows to perform some file input based manual setup sequence (e.g. setting some BIOS).
 	* return 0: step successful & init completed, -1: error, 1: step successful
@@ -293,6 +299,9 @@ AudioBackendAdapterBase.prototype = {
 	// used for interaction with player
 	setObserver: function(o) {
 		this._observer= o;
+	},
+	notifyAdapterReady: function() {
+		if (typeof this._observer !== "undefined" )	this._observer.notify();	
 	},
 	error: function(name) {
 		alert("fatal error: abstract method '"+name+"' must be defined");	
@@ -363,30 +372,44 @@ AudioBackendAdapterBase.prototype = {
 	}
 };
 
-
 /*
 * Emscripten based backends that produce 16-bit sample data.
+*
+* NOTE: This impl adds handling for asynchronously initialized 'backends', i.e.
+*       the 'backend' that is passed in, may not yet be usable (see WebAssebly based impls: 
+*       here a respective "onRuntimeInitialized" event will eventually originate from the 'backend'). 
+*       The 'backend' allows to register a "adapterCallback" hook to propagate the event - which is
+*       used here. The player typically observes the backend-adapter and when the adapter state changes, a 
+*       "notifyAdapterReady" is triggered so that the player is notified of the change.
 */
 EmsHEAP16BackendAdapter = (function(){ var $this = function (backend, channels) { 
 		$this.base.call(this, channels, 2);
 		this.Module= backend;
+		
+		// required if WASM (asynchronously loaded) is used in the backend impl
+		this.Module["adapterCallback"] = function() { 	// when Module is ready			
+			this.doOnAdapterReady();	// hook allows to perform additional initialization	
+			this.notifyAdapterReady();	// propagate to change to player
+		}.bind(this);
+		
 		if (!window.Math.fround) { window.Math.fround = window.Math.round; } // < Chrome 38 hack
 	}; 
 	extend(AudioBackendAdapterBase, $this, {
+		doOnAdapterReady: function() { },		// noop, to be overridden in subclasses 
+				
 		/* async emscripten init means that adapter may not immediately be ready - see async WASM compilation */
 		isAdapterReady: function() { 
 			if (typeof this.Module.notReady === "undefined")	return true; // default for backward compatibility		
 			return !this.Module.notReady;
 		},		
-		notifyAdapterReady: function() {
-			if (typeof this._observer !== "undefined" )	this._observer.notify();	
-		},
 		registerEmscriptenFileData: function(pathFilenameArray, data) {
 			// create a virtual emscripten FS for all the songs that are touched.. so the compiled code will
 			// always find what it is looking for.. some players will look to additional resource files in the same folder..
 			try {
 				this.Module.FS_createPath("/", pathFilenameArray[0], true, true);
-			} catch(e) {}
+			} catch(e) {
+				console.log("fail: FS_createPath('"+pathFilenameArray[0]+"')");
+			}
 			var f;
 			try {
 				f= this.Module.FS_createDataFile(pathFilenameArray[0], pathFilenameArray[1], data, true, true);
@@ -396,6 +419,8 @@ EmsHEAP16BackendAdapter = (function(){ var $this = function (backend, channels) 
 
 			} catch(err) {
 				// file may already exist, e.g. drag/dropped again.. just keep entry
+				console.log("fail: FS_createDataFile('"+pathFilenameArray[0]+", "+pathFilenameArray[1]+"') " + err);
+				
 			}
 			return f;		
 		},	
@@ -415,68 +440,6 @@ EmsHEAP16BackendAdapter = (function(){ var $this = function (backend, channels) 
 		}
 	
 	});	return $this; })();	
-
-/*
-* Experimental "optimization" using ASM.js
-*
-* Measurements for getCopiedAudio() in Firefox suggest that the ASM.js based function below 
-* actually runs about 20% faster than the regular JavaScript one: 0.039498214ms
-* instead of 0.049480069ms. Not that it matters.. still it was an interesting exercise.
-*/
-EmsHEAP16BackendAdapter_ASM = (function(){ var $this = function (backend, channels) { 
-		$this.base.call(this, backend, channels);
-		this.em_resampleBufferOffset= 0;
-	}; 
-	extend(EmsHEAP16BackendAdapter, $this, {
-		allocResampleBuffer: function(s) {
-			// alloc buffer on EMSCRIPTEN heap so it can be accessed from ASM.js
-			var dataPtr = this.Module._malloc(s*this._channels*this._bytesPerSample);	 
-		
-			if (this.em_resampleBufferOffset) {
-				this.Module._free(this.em_resampleBufferOffset);
-			}
-			this.em_resampleBufferOffset= dataPtr;
-			
-			return new Float32Array(this.Module.HEAPU8.buffer, dataPtr, s);
-		},
-		
-		ASM_copy: function(stdlib, foreign, heap) {
-			"use asm";
-			var i16 = new stdlib.Int16Array(heap);	
-			var f32 = new stdlib.Float32Array(heap);
-			
-			var  fround=  stdlib.Math.fround;
-			
-			function copyAudio(srcOffset, destOffset, len, channelsShift) {
-				srcOffset = (srcOffset|0);
-				destOffset = (destOffset|0);
-				len = (len|0); 
-				channelsShift = (channelsShift|0);
-				
-				var i= 0;
-				var j= 0;
-				
-				srcOffset= srcOffset<<1;
-				len= len<<1;
-				for(; (i|0) < (len|0); i=(i|0)+2|0,j=(j|0)+4|0){
-					// LOL - whether or not you correctly calc the array index, the ASM.js 
-					// compiler fails unless you shift it right here... 
-					f32[((destOffset+j)|0)>>2]= (fround((~(i16[((srcOffset+i)|0)>>1])))/fround(32768.0));
-				}
-				return (len>>1) >> channelsShift;	
-			}
-			return { copyAudio: copyAudio };
-		},
-		
-		getCopiedAudio: function(buffer, len) {
-			var arrayBuffer= this.Module.HEAP16.buffer;	// original EMSCRIPTEN heap area						
-			if (!this.asm_module) {
-				this.asm_module = this.ASM_copy(window, {}, arrayBuffer);
-			}
-			return this.asm_module.copyAudio(buffer, this.em_resampleBufferOffset, len*this._channels, (this._channels==2)?1:0);
-		}
-	});	return $this; })();	
-
 
 // cache all loaded files in global cache.
 FileCache = function() {
@@ -623,12 +586,22 @@ var ScriptNodePlayer = (function () {
 	
 // ******* general
 		notify: function() {	// used to handle asynchronously initialized backend impls
+			if ((typeof this.deferredPreload !== "undefined") && this._backendAdapter.isAdapterReady()) {
+				// now that the runtime is ready the "preload" can be started
+				var files= this.deferredPreload[0];
+				var onCompletionHandler= this.deferredPreload[1];
+				delete this.deferredPreload;
+				
+				this.preload(files, files.length, onCompletionHandler);
+			}
+		
 			if (this._preLoadReady && this._backendAdapter.isAdapterReady() && this._backendAdapter.isManualSetupComplete()) {
 				this._isPlayerReady= true;
 				this._onPlayerReady();
 			}			
 		},
-
+		handleBackendEvent: function() { this.notify(); }, // deprecated, use notify()!
+		
 		/**
 		* Is the player ready for use? (i.e. initialization completed)
 		*/
@@ -962,12 +935,6 @@ var ScriptNodePlayer = (function () {
 			}
 			return false;
 		},	
-		handleBackendEvent: function() {					
-			if(this._backendAdapter.isAdapterReady() && this._backendAdapter.isManualSetupComplete() && this._preLoadReady) {
-				this._isPlayerReady= true;
-				this._onPlayerReady();
-			}
-		},
 		//init WebAudio node pipeline
 		initWebAudio: function() {
 			if (typeof this._bufferSource != 'undefined') { 
@@ -1297,11 +1264,20 @@ var ScriptNodePlayer = (function () {
 			} 	
 		},
 		
+		
+		
 		// Avoid the async trial&error loading (if available) for those files that 
 		// we already know we'll be needing
 		preloadFiles: function(files, onCompletionHandler) {
 			this._isPaused= true;
-			this.preload(files, files.length, onCompletionHandler);
+			
+			if (this._backendAdapter.isAdapterReady()) {
+				// sync scenario: runtime is ready
+				this.preload(files, files.length, onCompletionHandler);
+			} else {
+				// async scenario:  runtime is NOT ready (e.g. emscripten WASM)
+				this["deferredPreload"] = [files, onCompletionHandler]; 
+			}			
 		},
 		setWaitingForFile: function(val) {
 			this.getCache().setWaitingForFile(val);

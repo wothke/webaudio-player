@@ -1,12 +1,7 @@
-Generic ScriptProcessor based WebAudio player 
-=============================================
+# Generic ScriptProcessor based WebAudio player 
 
-	version 1.0
- 	Copyright (C) 2015 Juergen Wothke
-
-	Terms of Use: This software is licensed under a CC BY-NC-SA 
-	(http://creativecommons.org/licenses/by-nc-sa/4.0/).
-
+version 1.02
+Copyright (C) 2015 Juergen Wothke
 
 This player relies on WebAudio ScriptProcessor generated sample data, i.e. is can be used 
 whenever there is an audio source that directly produces audio sample data. So far it has 
@@ -26,3 +21,12 @@ In order to use this player with a new audio source you have to write a respecti
 *BackendAdapter implementation. Unfortunately at the moment there isn't any documentation (in 
 addition to the occasional comment present in the non-minified *.js file). However the 
 nine chiptune players mentioned above provide examples to learn from..
+
+Note: In order to use WebAssembly based backends (all my backends can optionally be compiled 
+to WebAssembly) you'll need at least version 1.02 of the player (older versions are not
+equipped to deal with the asynchonous initialization).
+
+	
+## License	
+	Terms of Use: This software is licensed under a CC BY-NC-SA 
+	(http://creativecommons.org/licenses/by-nc-sa/4.0/).
