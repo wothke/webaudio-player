@@ -8,7 +8,7 @@
 *
 * <p>AudioBackendAdapterBase: an abstract base class for specific backend (i.e. 'sample data producer') integration.
 *
-*	version 1.02 (with WASM support)
+*	version 1.03 (with WASM support, cached filename translation)
 *
 * 	Copyright (C) 2017 Juergen Wothke
 *
@@ -288,6 +288,8 @@ AudioBackendAdapterBase.prototype = {
 	// if filename/path used by backend does not match the one used by the browser
 	mapBackendFilename: function(name) { return name;},
 	
+	// introduced for backward-compatibility..
+	mapCacheFileName: function(name) { return name;},
 	/*
 	* Backend may "push" update of song attributes (like author, copyright, etc)
 	*/ 
@@ -408,7 +410,6 @@ EmsHEAP16BackendAdapter = (function(){ var $this = function (backend, channels) 
 			try {
 				this.Module.FS_createPath("/", pathFilenameArray[0], true, true);
 			} catch(e) {
-				console.log("fail: FS_createPath('"+pathFilenameArray[0]+"')");
 			}
 			var f;
 			try {
@@ -419,7 +420,6 @@ EmsHEAP16BackendAdapter = (function(){ var $this = function (backend, channels) 
 
 			} catch(err) {
 				// file may already exist, e.g. drag/dropped again.. just keep entry
-				console.log("fail: FS_createDataFile('"+pathFilenameArray[0]+", "+pathFilenameArray[1]+"') " + err);
 				
 			}
 			return f;		
@@ -771,7 +771,8 @@ var ScriptNodePlayer = (function () {
 					onFail();
 					return;
 				} else {				
-					this.getCache().setFile(fullFilename, data);			
+					var cacheFilename= this._backendAdapter.mapCacheFileName(fullFilename);
+					this.getCache().setFile(cacheFilename, data);			
 				}
 				this.prepareTrackForPlayback(fullFilename, reader.result, options);
 				onCompletion(filename);
@@ -922,7 +923,8 @@ var ScriptNodePlayer = (function () {
 			return false;
 		},
 		loadMusicDataFromCache: function(fullFilename, options, onFail) {
-			var data= this.getCache().getFile(fullFilename);
+			var cacheFilename= this._backendAdapter.mapCacheFileName(fullFilename);
+			var data= this.getCache().getFile(cacheFilename);
 			
 			if (typeof data != 'undefined') {				
 				if(!this.prepareTrackForPlayback(fullFilename, data, options)) {
@@ -937,8 +939,10 @@ var ScriptNodePlayer = (function () {
 		},	
 		//init WebAudio node pipeline
 		initWebAudio: function() {
-			if (typeof this._bufferSource != 'undefined') { 
-				this._bufferSource.stop(0);
+			if (typeof this._bufferSource != 'undefined') {
+				try {
+					this._bufferSource.stop(0);
+				} catch(err) {/* ignore for the benefit of Safari(OS X) */}
 			} else {						
 				this._analyzerNode = window._gPlayerAudioCtx.createAnalyser();
 				this._scriptNode= this.createScriptProcessor(window._gPlayerAudioCtx);
@@ -1043,7 +1047,8 @@ var ScriptNodePlayer = (function () {
 		// convenience API which lets backend directly query the file size
 		fileSizeRequestCallback: function (name) {
 			var filename= this._backendAdapter.mapBackendFilename(name);
-			var f= this.getCache().getFile(filename);	// this API is only called after the file has actually loaded
+			var cacheFilename= this._backendAdapter.mapCacheFileName(filename);
+			var f= this.getCache().getFile(cacheFilename);	// this API is only called after the file has actually loaded
 			return f.length;
 		},
 		
@@ -1074,7 +1079,8 @@ var ScriptNodePlayer = (function () {
 			// note: function is used for "preload" and for "backend callback" loading... return values
 			// are only used for the later
 			
-			var data= this.getCache().getFile(fullFilename);
+			var cacheFilename= this._backendAdapter.mapCacheFileName(fullFilename);
+			var data= this.getCache().getFile(cacheFilename);
 			if (typeof data != 'undefined')	{
 				var retVal= 0;
 				// the respective file has already been setup
@@ -1094,8 +1100,8 @@ var ScriptNodePlayer = (function () {
 			this._isSongReady= false;
 					
 			// requested data not available.. we better load it for next time
-			if (!(fullFilename in this.getCache().getPendingMap())) {		// avoid duplicate loading
-				this.getCache().getPendingMap()[fullFilename] = 1;
+			if (!(cacheFilename in this.getCache().getPendingMap())) {		// avoid duplicate loading
+				this.getCache().getPendingMap()[cacheFilename] = 1;
 
 				var oReq = new XMLHttpRequest();
 				oReq.open("GET", fullFilename, true);
@@ -1111,10 +1117,10 @@ var ScriptNodePlayer = (function () {
 						var data= new Uint8Array(arrayBuffer);
 						var f= this._backendAdapter.registerFileData(pfn, data);
 
-						this.getCache().setFile(fullFilename, data);			
+						this.getCache().setFile(cacheFilename, data);			
 					}
-					if(!delete this.getCache().getPendingMap()[fullFilename]) {
-						this.trace("remove file from pending failed: "+fullFilename);
+					if(!delete this.getCache().getPendingMap()[cacheFilename]) {
+						this.trace("remove file from pending failed: "+cacheFilename);
 					}
 					onLoadedHandler();
 				}.bind(this);
@@ -1122,12 +1128,12 @@ var ScriptNodePlayer = (function () {
 				  if (oReq.readyState==4 && oReq.status==404) {
 					this.trace("preloadFile failed to load: "+ fullFilename);
 					
-					this.getCache().setFile(fullFilename, 0);							
+					this.getCache().setFile(cacheFilename, 0);							
 				  }
 				}.bind(this);
 				oReq.onerror  = function (oEvent) {
 				
-					this.getCache().setFile(fullFilename, 0);			
+					this.getCache().setFile(cacheFilename, 0);			
 				}.bind(this);
 
 				oReq.send(null);
