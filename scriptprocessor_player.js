@@ -10,13 +10,11 @@
 *
 *	version 1.03 (with WASM support, cached filename translation)
 *
-* 	Copyright (C) 2017 Juergen Wothke
+* 	Copyright (C) 2018 Juergen Wothke
 *
 * Terms of Use: This software is licensed under a CC BY-NC-SA 
 * (http://creativecommons.org/licenses/by-nc-sa/4.0/).
 */
-
-
 
 var fetchSamples= function (e) {
 	// it seems that it is necessary to keep this explicit reference to the event-handler
@@ -595,7 +593,7 @@ var ScriptNodePlayer = (function () {
 				this.preload(files, files.length, onCompletionHandler);
 			}
 		
-			if (this._preLoadReady && this._backendAdapter.isAdapterReady() && this._backendAdapter.isManualSetupComplete()) {
+			if (!this._isPlayerReady && this._preLoadReady && this._backendAdapter.isAdapterReady() && this._backendAdapter.isManualSetupComplete()) {
 				this._isPlayerReady= true;
 				this._onPlayerReady();
 			}			
