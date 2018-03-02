@@ -8,7 +8,7 @@
 *
 * <p>AudioBackendAdapterBase: an abstract base class for specific backend (i.e. 'sample data producer') integration.
 *
-*	version 1.03 (with WASM support, cached filename translation)
+*	version 1.03 (with WASM support, cached filename translation & track switch bugfix)
 *
 * 	Copyright (C) 2018 Juergen Wothke
 *
@@ -699,14 +699,18 @@ var ScriptNodePlayer = (function () {
 		* currently selected track).
 		* @param t time in millis
 		*/
-		setPlaybackTimeout: function(t) {			
+		setPlaybackTimeout: function(t) {
 			this._currentPlaytime= 0;
-			this._currentTimeout= t/1000*this._sampleRate;
+			if (t<0) {
+				this._currentTimeout= -1;
+			} else {
+				this._currentTimeout= t/1000*this._sampleRate;
+			}
 		},
 		/*
 		* Timeout in seconds.
 		*/
-		getPlaybackTimeout: function(t) {
+		getPlaybackTimeout: function() {
 			if (this._currentTimeout < 0) {
 				return -1;
 			} else {
@@ -921,6 +925,11 @@ var ScriptNodePlayer = (function () {
 			return false;
 		},
 		loadMusicDataFromCache: function(fullFilename, options, onFail) {
+			// reset timeout handling (of previous song.. which still might be playing)
+			this._currentTimeout= -1;
+			this._currentPlaytime= 0;
+			this._isPaused= true;
+				
 			var cacheFilename= this._backendAdapter.mapCacheFileName(fullFilename);
 			var data= this.getCache().getFile(cacheFilename);
 			
