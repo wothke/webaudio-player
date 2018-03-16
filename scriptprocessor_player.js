@@ -8,7 +8,7 @@
 *
 * <p>AudioBackendAdapterBase: an abstract base class for specific backend (i.e. 'sample data producer') integration.
 *
-*	version 1.03 (with WASM support, cached filename translation & track switch bugfix)
+*	version 1.03 (with WASM support, cached filename translation & track switch bugfix, "internal filename" mapping)
 *
 * 	Copyright (C) 2018 Juergen Wothke
 *
@@ -230,6 +230,19 @@ AudioBackendAdapterBase.prototype = {
 	},		
 
 	/*
+	* Creates the URL used to retrieve the song file.
+	*/
+	mapInternalFilename: function(overridePath, defaultPath, uri) {
+		return ((overridePath)?overridePath:defaultPath) + uri;	// this._basePath ever needed?
+	},
+	/*
+	* Allows to map the filenames used in the emulation to external URLs.
+	*/
+	mapUrl: function(filename) {
+		return filename;
+	},
+	
+	/*
 	* Allows to perform some file input based manual setup sequence (e.g. setting some BIOS).
 	* return 0: step successful & init completed, -1: error, 1: step successful
 	*/
@@ -295,7 +308,30 @@ AudioBackendAdapterBase.prototype = {
 	
 	
 // ************* built-in utility functions
-	
+	mapUri2Fs: function(uri) {		// use extended ASCII that most likely isn't used in filenames
+		// replace chars that cannot be used in file/foldernames
+		var out= uri.replace(/\/\//, "ýý");	
+			out = out.replace(/\?/, "ÿ");
+			out = out.replace(/:/, "þ");
+			out = out.replace(/\*/, "ü");
+			out = out.replace(/"/, "û");
+			out = out.replace(/</, "ù");
+			out = out.replace(/>/, "ø");
+			out = out.replace(/\|/, "÷");
+		return out;
+	},
+	mapFs2Uri: function(fs) {
+		var out= fs.replace(/ýý/, "//");
+			out = out.replace(/ÿ/, "?");
+			out = out.replace(/þ/, ":");
+			out = out.replace(/ü/, "*");
+			out = out.replace(/û/, "\"");
+			out = out.replace(/ù/, "<");
+			out = out.replace(/ø/, ">");
+			out = out.replace(/÷/, "|");
+		return out;
+	},
+
 	// used for interaction with player
 	setObserver: function(o) {
 		this._observer= o;
@@ -307,6 +343,7 @@ AudioBackendAdapterBase.prototype = {
 		alert("fatal error: abstract method '"+name+"' must be defined");	
 	},
 	resetSampleRate: function(sampleRate, inputSampleRate) {
+		// FIXME todo: _currentTimeout must also be reset! 
 		if (sampleRate > 0) { this._sampleRate= sampleRate; }
 		if (inputSampleRate > 0) { this._inputSampleRate= inputSampleRate; }
 		
@@ -405,6 +442,8 @@ EmsHEAP16BackendAdapter = (function(){ var $this = function (backend, channels) 
 		registerEmscriptenFileData: function(pathFilenameArray, data) {
 			// create a virtual emscripten FS for all the songs that are touched.. so the compiled code will
 			// always find what it is looking for.. some players will look to additional resource files in the same folder..
+
+			// Unfortunately the FS.findObject() API is not exported.. so it's exception catching time
 			try {
 				this.Module.FS_createPath("/", pathFilenameArray[0], true, true);
 			} catch(e) {
@@ -467,6 +506,10 @@ FileCache.prototype = {
 		}
 		return data;
 	},
+	
+	// FIXME the unlimited caching of files should probably be restricted:
+	// currently all loaded song data stays in memory as long as the page is opened
+	// maybe ist add some manual "reset"? 
 	setFile: function(filename, data) {
 		this._binaryFileMap[filename]= data;
 		this._isWaitingForFile= false;
@@ -792,12 +835,12 @@ var ScriptNodePlayer = (function () {
 		* Loads from an URL.
 		*/
 		loadMusicFromURL: function(url, options, onCompletion, onFail, onProgress) {
-			var fullFilename= ((options.basePath)?options.basePath:this._basePath) + url;	// this._basePath ever needed?
+			var fullFilename= this._backendAdapter.mapInternalFilename(options.basePath, this._basePath, url);
 			
 			if (this.loadMusicDataFromCache(fullFilename, options, onFail)) { return; }
 			
 			var xhr = new XMLHttpRequest();
-			xhr.open("GET", fullFilename, true);
+			xhr.open("GET", this._backendAdapter.mapUrl(fullFilename), true);
 			xhr.responseType = "arraybuffer";
 			
 			xhr.onload = function (oEvent) {
@@ -982,6 +1025,12 @@ var ScriptNodePlayer = (function () {
 				
 				var data= new Uint8Array(arrayBuffer);
 				this._backendAdapter.registerFileData(pfn, data);	// in case the backend "needs" to retrieve the file by name 
+				
+				// FIXME regression test
+				var cacheFilename= this._backendAdapter.mapCacheFileName(fullFilename);
+				this.getCache().setFile(cacheFilename, data);			
+				// FIXME regression test
+				
 				var ret= this._backendAdapter.loadMusicData(this._sampleRate, pfn[0], pfn[1], data, options);
 
 				if (ret === 0) {			
@@ -1111,7 +1160,7 @@ var ScriptNodePlayer = (function () {
 				this.getCache().getPendingMap()[cacheFilename] = 1;
 
 				var oReq = new XMLHttpRequest();
-				oReq.open("GET", fullFilename, true);
+				oReq.open("GET", this._backendAdapter.mapUrl(fullFilename), true);
 				oReq.responseType = "arraybuffer";
 
 				oReq.onload = function (oEvent) {
