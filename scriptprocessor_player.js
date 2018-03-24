@@ -8,7 +8,7 @@
 *
 * <p>AudioBackendAdapterBase: an abstract base class for specific backend (i.e. 'sample data producer') integration.
 *
-*	version 1.03 (with WASM support, cached filename translation & track switch bugfix, "internal filename" mapping)
+*	version 1.03 (with WASM support, cached filename translation & track switch bugfix, "internal filename" mapping, getVolume)
 *
 * 	Copyright (C) 2018 Juergen Wothke
 *
@@ -714,6 +714,13 @@ var ScriptNodePlayer = (function () {
 			if (typeof this._gainNode != 'undefined') { 
 				this._gainNode.gain.value= value;
 			}
+		},
+		
+		getVolume: function() {
+			if (typeof this._gainNode != 'undefined') { 
+				return this._gainNode.gain.value;
+			}
+			return -1;
 		},
 		
 		/*
