@@ -8,7 +8,8 @@
 *
 * <p>AudioBackendAdapterBase: an abstract base class for specific backend (i.e. 'sample data producer') integration.
 *
-*	version 1.03 (with WASM support, cached filename translation & track switch bugfix, "internal filename" mapping, getVolume)
+*	version 1.03a (with WASM support, cached filename translation & track switch bugfix, "internal filename" 
+				mapping, getVolume, setPanning)
 *
 * 	Copyright (C) 2018 Juergen Wothke
 *
@@ -588,10 +589,13 @@ var ScriptNodePlayer = (function () {
 			// general WebAudio stuff
 		this._bufferSource;
 		this._gainNode;
+		this._panNode;
 		this._analyzerNode;
 		this._scriptNode;
 		this._freqByteData = 0; 
-				
+		
+		this._pan= 0;	// unchanged
+		
 		// the below entry points are published globally they can be 
 		// easily referenced from the outside..
 				
@@ -721,6 +725,17 @@ var ScriptNodePlayer = (function () {
 				return this._gainNode.gain.value;
 			}
 			return -1;
+		},
+		/**
+		* May be a no-op if browser does not support StereoPannerNode
+		* @value -1 to 1
+		*/
+		setPanning: function(value) {
+			this._pan= value;	// in case the WebAudio chain has not been setup yet
+			
+			if ((typeof this._panNode != 'undefined') && ( this._panNode != null)) {				
+				this._panNode.pan.setValueAtTime(value, window._gPlayerAudioCtx.currentTime);
+			}
 		},
 		
 		/*
@@ -1012,11 +1027,23 @@ var ScriptNodePlayer = (function () {
 					var tickerScriptNode= this.createTickerScriptProcessor(window._gPlayerAudioCtx);
 					tickerScriptNode.connect(this._gainNode);
 				}
+				
+				// use panner if supported by the browser (i.e. not IE or Safari crap)
+				var source= this._gainNode;				
+				this._panNode= null;
+				try {					
+					this._panNode= window._gPlayerAudioCtx.createStereoPanner();
+					source.connect(this._panNode);
+					source = this._panNode;
+					
+					this.setPanning(this._pan);
+				} catch (ignore) {}				
+				
 				if (this._spectrumEnabled) {
-					this._gainNode.connect(this._analyzerNode);
+					source.connect(this._analyzerNode);
 					this._analyzerNode.connect(window._gPlayerAudioCtx.destination);
 				} else {
-					this._gainNode.connect(window._gPlayerAudioCtx.destination);
+					source.connect(window._gPlayerAudioCtx.destination);
 				}
 			}
 		},
@@ -1372,7 +1399,9 @@ var ScriptNodePlayer = (function () {
 				old._isPaused= true;
 				
 				if (typeof old._bufferSource != 'undefined') { 
-					old._bufferSource.stop(0);
+					try {
+						old._bufferSource.stop(0);
+					} catch(err) {/* ignore for the benefit of Safari(OS X) */}
 				}			
 				if (old._scriptNode) old._scriptNode.disconnect(0);
 				if (old._analyzerNode) old._analyzerNode.disconnect(0);
