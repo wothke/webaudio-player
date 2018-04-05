@@ -8,7 +8,7 @@
 *
 * <p>AudioBackendAdapterBase: an abstract base class for specific backend (i.e. 'sample data producer') integration.
 *
-*	version 1.03a (with WASM support, cached filename translation & track switch bugfix, "internal filename" 
+*	version 1.03b (with WASM support, cached filename translation & track switch bugfix, "internal filename" 
 				mapping, getVolume, setPanning)
 *
 * 	Copyright (C) 2018 Juergen Wothke
@@ -207,6 +207,11 @@ AudioBackendAdapterBase.prototype = {
 	* Return sample value in range: -1..1 
 	*/
 	readFloatSample: function(buffer, idx) 		{this.error("readFloatSample");},
+
+	/**
+	* @param pan 0..2 (1 creates mono)
+	*/
+	applyPanning: function(buffer, len, pan) 	{this.error("applyPanning");},
 
 	/**
 	* Return size one sample in bytes
@@ -465,6 +470,28 @@ EmsHEAP16BackendAdapter = (function(){ var $this = function (backend, channels) 
 		readFloatSample: function(buffer, idx) {
 			return (this.Module.HEAP16[buffer+idx])/0x8000;
 		},
+		// certain songs use an unfavorable L/R separation - e.g. bass on one channel - that is 
+		// not nice to listen to. This "panning" impl allows to "mono"-ify those songs.. (this._pan=1 
+		// creates mono)
+		applyPanning: function(buffer, len, pan) {
+			pan=  pan * 256.0 / 2.0;
+			 
+			var i, l, r, m;
+			for (i = 0; i < len*2; i+=2) {
+				l = this.Module.HEAP16[buffer+i];
+				r = this.Module.HEAP16[buffer+i+1];
+				m = (r - l) * pan;
+				
+				var nl= ((l << 8) + m) >> 8;
+				var nr= ((r << 8) - m) >> 8;
+				this.Module.HEAP16[buffer+i] = nl;
+				this.Module.HEAP16[buffer+i+1] = nr;
+				/*
+				if ((this.Module.HEAP16[buffer+i] != nl) || (this.Module.HEAP16[buffer+i+1] == nr)) {
+					console.log("X");
+				}*/
+			}	
+		},
 		/* try to speed-up copy operation by inlining the access logic (which does indeed 
 		 * seem to make a difference) 
 		 */
@@ -589,12 +616,13 @@ var ScriptNodePlayer = (function () {
 			// general WebAudio stuff
 		this._bufferSource;
 		this._gainNode;
-		this._panNode;
+		this._panNodeL;
+		this._panNodeR;
 		this._analyzerNode;
 		this._scriptNode;
 		this._freqByteData = 0; 
 		
-		this._pan= 0;	// unchanged
+		this._pan= null;	// default: inactive
 		
 		// the below entry points are published globally they can be 
 		// easily referenced from the outside..
@@ -727,15 +755,10 @@ var ScriptNodePlayer = (function () {
 			return -1;
 		},
 		/**
-		* May be a no-op if browser does not support StereoPannerNode
-		* @value -1 to 1
+		* @value null=inactive; or range; -1 to 1 (-1 is original stereo, 0 creates "mono", 1 is inverted stereo)
 		*/
 		setPanning: function(value) {
-			this._pan= value;	// in case the WebAudio chain has not been setup yet
-			
-			if ((typeof this._panNode != 'undefined') && ( this._panNode != null)) {				
-				this._panNode.pan.setValueAtTime(value, window._gPlayerAudioCtx.currentTime);
-			}
+			this._pan= value;
 		},
 		
 		/*
@@ -1015,35 +1038,29 @@ var ScriptNodePlayer = (function () {
 				try {
 					this._bufferSource.stop(0);
 				} catch(err) {/* ignore for the benefit of Safari(OS X) */}
-			} else {						
-				this._analyzerNode = window._gPlayerAudioCtx.createAnalyser();
-				this._scriptNode= this.createScriptProcessor(window._gPlayerAudioCtx);
-				this._gainNode = window._gPlayerAudioCtx.createGain();	
+			} else {
+				var ctx= window._gPlayerAudioCtx;
+				this._analyzerNode = ctx.createAnalyser();
+				this._scriptNode= this.createScriptProcessor(ctx);
+				this._gainNode = ctx.createGain();	
 				
 				this._scriptNode.connect(this._gainNode);				
 
 				// optional add-on
 				if (typeof this._externalTicker !== 'undefined') {
-					var tickerScriptNode= this.createTickerScriptProcessor(window._gPlayerAudioCtx);
+					var tickerScriptNode= this.createTickerScriptProcessor(ctx);
 					tickerScriptNode.connect(this._gainNode);
 				}
 				
-				// use panner if supported by the browser (i.e. not IE or Safari crap)
-				var source= this._gainNode;				
-				this._panNode= null;
-				try {					
-					this._panNode= window._gPlayerAudioCtx.createStereoPanner();
-					source.connect(this._panNode);
-					source = this._panNode;
-					
-					this.setPanning(this._pan);
-				} catch (ignore) {}				
+				// note: "panning" experiments using StereoPanner, ChannelSplitter / ChannelMerger
+				// led to bloody useless results: rather implement respective "panning"
+				// logic directly to get the exact effect that is needed here..
 				
 				if (this._spectrumEnabled) {
-					source.connect(this._analyzerNode);
-					this._analyzerNode.connect(window._gPlayerAudioCtx.destination);
+					this._gainNode.connect(this._analyzerNode);
+					this._analyzerNode.connect(ctx.destination);
 				} else {
-					source.connect(window._gPlayerAudioCtx.destination);
+					this._gainNode.connect(ctx.destination);
 				}
 			}
 		},
@@ -1232,7 +1249,7 @@ var ScriptNodePlayer = (function () {
 		},
 		tick: function(event) {
 			this._currentTick++;
-		},		
+		},	
 		// called for 'onaudioprocess' to feed new batch of sample data
 		genSamples: function(event) {		
 			var output1 = event.outputBuffer.getChannelData(0);
@@ -1300,7 +1317,10 @@ var ScriptNodePlayer = (function () {
 						// refresh just in case they are not using one fixed buffer..
 						this._sourceBuffer= this._backendAdapter.getAudioBuffer();
 						this._sourceBufferLen= this._backendAdapter.getAudioBufferLength();
-
+				
+						if (this._pan != null)
+							this._backendAdapter.applyPanning(this._sourceBuffer, this._sourceBufferLen, this._pan+1.0);
+						
 						this._numberOfSamplesToRender =  this._backendAdapter.getResampledAudio(this._sourceBuffer, this._sourceBufferLen);
 						
 						this._sourceBufferIdx=0;			
