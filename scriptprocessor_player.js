@@ -8,8 +8,8 @@
 *
 * <p>AudioBackendAdapterBase: an abstract base class for specific backend (i.e. 'sample data producer') integration.
 *
-*	version 1.03b (with WASM support, cached filename translation & track switch bugfix, "internal filename" 
-				mapping, getVolume, setPanning)
+*	version 1.03c (with WASM support, cached filename translation & track switch bugfix, "internal filename" 
+*				mapping, getVolume, setPanning, AudioContext get/resume)
 *
 * 	Copyright (C) 2018 Juergen Wothke
 *
@@ -1031,9 +1031,21 @@ var ScriptNodePlayer = (function () {
 				return true;
 			}
 			return false;
-		},	
+		},
+		getAudioContext: function() {
+			return window._gPlayerAudioCtx; // needs to be exposed due to Chrome's new bullshit "autoplay policy"
+		},
 		//init WebAudio node pipeline
 		initWebAudio: function() {
+			if (window.chrome) {
+				// handle Chrome's new bullshit "autoplay policy" (this methood is
+				// called before each "play" attempt)
+				if (window._gPlayerAudioCtx.state == "suspended") {
+					try {window._gPlayerAudioCtx.resume();} catch(e) {}					
+				}				
+			}
+			
+			
 			if (typeof this._bufferSource != 'undefined') {
 				try {
 					this._bufferSource.stop(0);
