@@ -8,8 +8,8 @@
 *
 * <p>AudioBackendAdapterBase: an abstract base class for specific backend (i.e. 'sample data producer') integration.
 *
-*	version 1.03c (with WASM support, cached filename translation & track switch bugfix, "internal filename" 
-*				mapping, getVolume, setPanning, AudioContext get/resume)
+*	version 1.03d (with WASM support, cached filename translation & track switch bugfix, "internal filename" 
+*				mapping, getVolume, setPanning, AudioContext get/resume, AbstractTicker revisited, bugfix for duplicate events)
 *
 * 	Copyright (C) 2018 Juergen Wothke
 *
@@ -80,6 +80,22 @@ function extend(base, sub, methods) {
 /*
 * Subclass this class in order to sync/associate stuff with the audio playback. 
 * 
+* The basic problem: WebAudio will request additional audio data whenever *it feels like* requesting it. The provider of that data has
+* no way of knowing when exactly the delivered data will actually be used. WebAudio usually requests it *before* its current supply runs 
+* out. Supposing WebAudio requests chunks of 8192 samples at a time (which is the default used here). Depending on the user's screen refresh
+* rate (e.g. 50Hz) and the browser's playback rate (e.g. 44100Hz) a different number of samples will correspond to one typical animation frame,
+* i.e. screen redraw (e.g. 882 samples). The sample "supply" delivered in one batch may then last for roughly 1/5 of a second (obviously much less 
+* when higher playback speeds are used).
+* The size of the sample data batches delivered by the underlying emulator may then not directly match the chunks requested by WebAudio, i.e. 
+* there may be more or also less data than what is needed for one WebAudio request. And as a further complication the sample rate used by the
+* backend may differ from the one used by WebAudio, i.e. the raw data relivered by the emulator backend may be subject to a resampling.
+* With regards to the actual audio playback this isn't a problem. But the problems start if there is additional data accociated with the 
+* audio data (maybe some raw data that was used to create the respective audio data) and the GUI needs to handle that add-on data *IN SYNC*
+* with the actual playback, e.g. visualize the audio that is played back.
+*
+* It is the purpose of this AbstractTicker API to deal with that problem and provide the GUI with some API that allows to access 
+* add-on data in-sync with the playback. 
+*
 * If a respective subclass is specified upon instanciation of the ScriptNodePlayer, then the player will track 
 * playback progress as 'ticks' (one 'tick' typically measuring 256 audio samples). "Ticks" are measured within the
 * context of the current playback buffer and whenever a new buffer is played the counting restarts from 0.
@@ -102,14 +118,23 @@ AbstractTicker.prototype = {
 	*/
 	init: function(samplesPerBuffer, tickerStepWidth) {},
 	/*
-	* Invoked with each audio buffer before it is played.
-	*/
-	calcTickData: function(output1, output2) {},
-	
-	/*
 	* Gets called each time the computeAudioSamples() has been invoked.
+	* <p>Legacy API left "as-is" for backward compatibility.
 	*/
-	computeAudioSamplesNotify: function() {}
+	computeAudioSamplesNotify: function() {},
+	/*
+	* Hook allows to resample the add-on data in-sync with the underlying audio data.
+	*/
+	resampleData: function(sampleRate, inputSampleRate, origLen, backendAdapter) {},	
+	/*
+	* Copies data from the resampled input buffers to the "WebAudio chunk" output
+	*/
+	copyTickerData: function(outBufferIdx, inBufferIdx) {},
+	/*
+	* Invoked with each audio buffer before it is played.
+	* <p>Legacy API left "as-is" for backward compatibility.
+	*/
+	calcTickData: function(output1, output2) {}
 };
 
 
@@ -362,33 +387,41 @@ AudioBackendAdapterBase.prototype = {
 	allocResampleBuffer: function(s) {
 		return new Float32Array(s);
 	},
-	getCopiedAudio: function(buffer, len) {
+	getCopiedAudio: function(input, len, funcReadFloat, resampleOutput) {
 		var i;
 		// just copy the rescaled values so there is no need for special handling in playback loop
 		for(i= 0; i<len*this._channels; i++){
-			this._resampleBuffer[i]= this.readFloatSample(buffer, i); 
+			resampleOutput[i]= funcReadFloat(input, i); 
 		}		
 		return len;	
 	},
-	getResampledAudio: function(buffer, len) {	
+	resampleTickerData: function(externalTicker, origLen) {
+		externalTicker.resampleData(this._sampleRate, this._inputSampleRate, origLen, this);
+	},
+	getResampledAudio: function(input, len) {
+		return this.getResampledFloats(input, len, this._sampleRate, this._inputSampleRate);
+	},
+	getResampledFloats: function(input, len, sampleRate, inputSampleRate) {	
 		var resampleLen;
-		if (this._sampleRate == this._inputSampleRate) {		
-			resampleLen= this.getCopiedAudio(buffer, len);
+		if (sampleRate == inputSampleRate) {		
+			resampleLen= this.getCopiedAudio(input, len, this.readFloatSample.bind(this), this._resampleBuffer);
 		} else {
-			resampleLen= Math.round(len * this._sampleRate / this._inputSampleRate);	
+			resampleLen= Math.round(len * sampleRate / inputSampleRate);	
 			var bufSize= resampleLen * this._channels;	// for each of the x channels
 			
 			if (bufSize > this._resampleBuffer.length) { this._resampleBuffer= this.allocResampleBuffer(bufSize); }
 			
 			// only mono and interleaved stereo data is currently implemented..
-			this.resampleChannel(0, buffer, len, resampleLen);
+			this.resampleToFloat(this._channels, 0, input, len, this.readFloatSample.bind(this), this._resampleBuffer, resampleLen);
 			if (this._channels == 2) {
-				this.resampleChannel(1, buffer, len, resampleLen);
+				this.resampleToFloat(this._channels, 1, input, len, this.readFloatSample.bind(this), this._resampleBuffer, resampleLen);
 			}
 		}
 		return resampleLen;
 	},
-	resampleChannel: function(channelId, buffer, len, resampleLen) {
+	
+	// utility
+	resampleToFloat: function(channels, channelId, inputPtr, len, funcReadFloat, resampleOutput, resampleLen) {
 		// Bresenham algorithm based resampling
 		var x0= 0;
 		var y0= 0;
@@ -401,8 +434,8 @@ AudioBackendAdapterBase.prototype = {
 
 		var i;
 		for(;;){
-			i= (x0*this._channels) + channelId;
-			this._resampleBuffer[i]= this.readFloatSample(buffer, (y0*this._channels) + channelId);
+			i= (x0*channels) + channelId;
+			resampleOutput[i]= funcReadFloat(inputPtr, (y0*channels) + channelId);
 
 			if (x0>=x1 && y0>=y1) { break; }
 			e2 = 2*err;
@@ -491,19 +524,7 @@ EmsHEAP16BackendAdapter = (function(){ var $this = function (backend, channels) 
 					console.log("X");
 				}*/
 			}	
-		},
-		/* try to speed-up copy operation by inlining the access logic (which does indeed 
-		 * seem to make a difference) 
-		 */
-		getCopiedAudio: function(buffer, len) {
-			var i= 0;
-			// just copy the rescaled values so there is no need for special handling in playback loop
-			for(i= 0; i<len*this._channels; i++){
-				this._resampleBuffer[i]= (this.Module.HEAP16[buffer+i])/0x8000;
-			}		
-			return len;	
 		}
-	
 	});	return $this; })();	
 
 // cache all loaded files in global cache.
@@ -848,6 +869,8 @@ var ScriptNodePlayer = (function () {
 		loadMusicFromTmpFile: function (file, options, onCompletion, onFail, onProgress) {
 			var filename= file.name;	// format detection may depend on prefixes and postfixes..
 
+			this._fileReadyNotify= "";
+			
 			var fullFilename= ((options.basePath)?options.basePath:this._basePath) + filename;	// this._basePath ever needed?
 			if (this.loadMusicDataFromCache(fullFilename, options, onFail)) { return; }
 
@@ -881,6 +904,8 @@ var ScriptNodePlayer = (function () {
 		*/
 		loadMusicFromURL: function(url, options, onCompletion, onFail, onProgress) {
 			var fullFilename= this._backendAdapter.mapInternalFilename(options.basePath, this._basePath, url);
+
+			this._fileReadyNotify= "";
 			
 			if (this.loadMusicDataFromCache(fullFilename, options, onFail)) { return; }
 			
@@ -998,9 +1023,16 @@ var ScriptNodePlayer = (function () {
 					return false;
 				}
 				this.updateSongInfo(fullFilename);	  
-				
-				this._onTrackReadyToPlay();
-				
+	
+				if ((this.lastUsedFilename == fullFilename)) {
+					if (this._fileReadyNotify == fullFilename) {
+						// duplicate we already notified about.. probably some retry due to missing load-on-demand files
+						this.play();	// user had already expressed his wish to play
+					} else {
+						this._onTrackReadyToPlay();
+					}
+					this._fileReadyNotify= fullFilename;	
+				}
 				this._isPaused= false;
 				return true;		
 
@@ -1008,7 +1040,6 @@ var ScriptNodePlayer = (function () {
 				this._initInProgress= false;
 				// error that cannot be resolved.. (e.g. file not exists)
 				this.trace("initIfNeeded - fatal error");
-//				if (this.onError) this.onError();	// so far is doesn't seem that we need an onError..
 			}
 			return false;
 		},
@@ -1148,8 +1179,8 @@ var ScriptNodePlayer = (function () {
 		// ------------------- async file-load ( also explained in introduction above) --------------------------------
 
 		// backend attempts to read some file using fileRequestCallback() function: if the file is available 
-		// (i.e. its binary data has already been loaded) the function signals the success by returning 0. 
-		// If the file has not yet been loaded the function returns -1. 
+		// (i.e. its binary data has already been loaded) the function signals the success by returning 0 where as 1 means
+		// that the file does not exist. If the file has not yet been loaded the function returns -1. 
 		// As soon as the player completes an asynchronous file-load it passes the loaded data to the backendAdapter's 
 		// registerFileData() API. It is then up to the backendAdapter's impl to create some filename based file 
 		// cache which is used by the backend to retrieve "available" files. (Example: An Emscripten based backend uses 
@@ -1260,6 +1291,7 @@ var ScriptNodePlayer = (function () {
 			return -1;	
 		},
 		tick: function(event) {
+			if (!this._isPaused) 
 			this._currentTick++;
 		},	
 		// called for 'onaudioprocess' to feed new batch of sample data
@@ -1312,16 +1344,11 @@ var ScriptNodePlayer = (function () {
 							} else {
 								if (status > 1)	{
 									this.trace("playback aborted with an error");
-//									this.onError();	// so far is doesn't seem that we need an onError..
 								}
 								
-								// note: this code will also be hit if additional load is triggered 
-								// from the playback, i.e. exclude that case
+								this._isPaused= true;	// stop playback (or this will retrigger again and again before new song is started)
 								if (this._onTrackEnd) {
 									this._onTrackEnd();
-								} else {
-									// FIXME regression test
-									this._isPaused= true;
 								}
 								return;							
 							}
@@ -1335,6 +1362,9 @@ var ScriptNodePlayer = (function () {
 						
 						this._numberOfSamplesToRender =  this._backendAdapter.getResampledAudio(this._sourceBuffer, this._sourceBufferLen);
 						
+						if (typeof this._externalTicker !== 'undefined') {
+							this._backendAdapter.resampleTickerData(this._externalTicker, this._sourceBufferLen);
+						}
 						this._sourceBufferIdx=0;			
 					}
 										
@@ -1342,7 +1372,7 @@ var ScriptNodePlayer = (function () {
 					if (this.isStereo()) {
 						this.copySamplesStereo(resampleBuffer, output1, output2, outSize);
 					} else {
-						this.copySamplesMono(resampleBuffer, output1, output2, outSize);
+						this.copySamplesMono(resampleBuffer, output1, outSize);
 					}
 				}
 				
@@ -1359,6 +1389,9 @@ var ScriptNodePlayer = (function () {
 				var availableSpace = outSize-this._numberOfSamplesRendered;
 				
 				for (i= 0; i<availableSpace; i++) {
+					if (typeof this._externalTicker !== 'undefined') {
+						this._externalTicker.copyTickerData(i+this._numberOfSamplesRendered, (this._sourceBufferIdx>>1));
+					}					
 					output1[i+this._numberOfSamplesRendered]= resampleBuffer[this._sourceBufferIdx++];
 					output2[i+this._numberOfSamplesRendered]= resampleBuffer[this._sourceBufferIdx++];
 				}				
@@ -1366,6 +1399,9 @@ var ScriptNodePlayer = (function () {
 				this._numberOfSamplesRendered = outSize;
 			} else {
 				for (i= 0; i<this._numberOfSamplesToRender; i++) {
+					if (typeof this._externalTicker !== 'undefined') {
+						this._externalTicker.copyTickerData(i+this._numberOfSamplesRendered, (this._sourceBufferIdx>>1));
+					}					
 					output1[i+this._numberOfSamplesRendered]= resampleBuffer[this._sourceBufferIdx++];
 					output2[i+this._numberOfSamplesRendered]= resampleBuffer[this._sourceBufferIdx++];
 				}						
@@ -1373,18 +1409,24 @@ var ScriptNodePlayer = (function () {
 				this._numberOfSamplesToRender = 0;
 			} 	
 		},
-		copySamplesMono: function(resampleBuffer, output1, output2, outSize) {
+		copySamplesMono: function(resampleBuffer, output1, outSize) {
 			var i;
 			if (this._numberOfSamplesRendered + this._numberOfSamplesToRender > outSize) {
 				var availableSpace = outSize-this._numberOfSamplesRendered;
 				
 				for (i= 0; i<availableSpace; i++) {
+					if (typeof this._externalTicker !== 'undefined') {
+						this._externalTicker.copyTickerData(i+this._numberOfSamplesRendered, this._sourceBufferIdx);
+					}					
 					output1[i+this._numberOfSamplesRendered]= resampleBuffer[this._sourceBufferIdx++];
 				}				
 				this._numberOfSamplesToRender -= availableSpace;
 				this._numberOfSamplesRendered = outSize;
 			} else {
 				for (i= 0; i<this._numberOfSamplesToRender; i++) {
+					if (typeof this._externalTicker !== 'undefined') {
+						this._externalTicker.copyTickerData(i+this._numberOfSamplesRendered, this._sourceBufferIdx);
+					}					
 					output1[i+this._numberOfSamplesRendered]= resampleBuffer[this._sourceBufferIdx++];
 				}						
 				this._numberOfSamplesRendered += this._numberOfSamplesToRender;
