@@ -8,7 +8,7 @@
 *
 * <p>AudioBackendAdapterBase: an abstract base class for specific backend (i.e. 'sample data producer') integration.
 *
-*	version 1.03d (with WASM support, cached filename translation & track switch bugfix, "internal filename" 
+*	version 1.03d+ (with WASM support, cached filename translation & track switch bugfix, "internal filename" 
 *				mapping, getVolume, setPanning, AudioContext get/resume, AbstractTicker revisited, bugfix for duplicate events)
 *
 * 	Copyright (C) 2018 Juergen Wothke
@@ -118,8 +118,12 @@ AbstractTicker.prototype = {
 	*/
 	init: function(samplesPerBuffer, tickerStepWidth) {},
 	/*
+	* Gets called at the start of each audio buffer generation.
+	*/
+	start: function() {},
+	/*
 	* Gets called each time the computeAudioSamples() has been invoked.
-	* <p>Legacy API left "as-is" for backward compatibility.
+	* @deprecated Legacy API used in early VU meter experiments
 	*/
 	computeAudioSamplesNotify: function() {},
 	/*
@@ -127,12 +131,12 @@ AbstractTicker.prototype = {
 	*/
 	resampleData: function(sampleRate, inputSampleRate, origLen, backendAdapter) {},	
 	/*
-	* Copies data from the resampled input buffers to the "WebAudio chunk" output
+	* Copies data from the resampled input buffers to the "WebAudio audio buffer" sized output.
 	*/
 	copyTickerData: function(outBufferIdx, inBufferIdx) {},
 	/*
-	* Invoked with each audio buffer before it is played.
-	* <p>Legacy API left "as-is" for backward compatibility.
+	* Invoked after audio buffer content has been generated.
+	* @deprecated Legacy API used in early VU meter experiments
 	*/
 	calcTickData: function(output1, output2) {}
 };
@@ -1308,6 +1312,10 @@ var ScriptNodePlayer = (function () {
 					if (this.isStereo()) { output2[i]= 0; }
 				}		
 			} else {
+				if (typeof this._externalTicker !== 'undefined') {
+					this._externalTicker.start();
+				}
+				
 				var outSize= output1.length;
 				
 				this._numberOfSamplesRendered = 0;		
