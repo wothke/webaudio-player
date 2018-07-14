@@ -8,8 +8,9 @@
 *
 * <p>AudioBackendAdapterBase: an abstract base class for specific backend (i.e. 'sample data producer') integration.
 *
-*	version 1.03d+ (with WASM support, cached filename translation & track switch bugfix, "internal filename" 
-*				mapping, getVolume, setPanning, AudioContext get/resume, AbstractTicker revisited, bugfix for duplicate events)
+*	version 1.03e (with WASM support, cached filename translation & track switch bugfix, "internal filename" 
+*				mapping, getVolume, setPanning, AudioContext get/resume, AbstractTicker revisited, bugfix for 
+*               duplicate events, improved "play after user gesture" support)
 *
 * 	Copyright (C) 2018 Juergen Wothke
 *
@@ -33,7 +34,6 @@ var calcTick= function (e) {
 
 var setGlobalWebAudioCtx= function() {
 	if (typeof window._gPlayerAudioCtx == 'undefined') {	// cannot be instantiated 2x (so make it global)
-		
 		var errText= 'Web Audio API is not supported in this browser';
 		try {			
 			if('AudioContext' in window) {
@@ -42,11 +42,16 @@ var setGlobalWebAudioCtx= function() {
 				window._gPlayerAudioCtx = new webkitAudioContext();		// legacy stuff
 			} else {
 				alert(errText + e);
-			}
+			}			
 		} catch(e) {
 			alert(errText + e);
 		}
-	}		
+	}
+	try {			
+		if (window._gPlayerAudioCtx.state === 'suspended' && 'ontouchstart' in window) {	//iOS shit
+			window._gPlayerAudioCtx.resume();
+		}
+	} catch(ignore) {}
 }
 
 /* 
@@ -142,7 +147,7 @@ AbstractTicker.prototype = {
 };
 
 
-var SAMPLES_PER_BUFFER = 8192;// allowed: buffer sizes: 256, 512, 1024, 2048, 4096, 8192, 16384
+var SAMPLES_PER_BUFFER = 8192; // allowed: buffer sizes: 256, 512, 1024, 2048, 4096, 8192, 16384
 
 		
 /*
@@ -378,7 +383,6 @@ AudioBackendAdapterBase.prototype = {
 		alert("fatal error: abstract method '"+name+"' must be defined");	
 	},
 	resetSampleRate: function(sampleRate, inputSampleRate) {
-		// FIXME todo: _currentTimeout must also be reset! 
 		if (sampleRate > 0) { this._sampleRate= sampleRate; }
 		if (inputSampleRate > 0) { this._inputSampleRate= inputSampleRate; }
 		
@@ -562,12 +566,11 @@ FileCache.prototype = {
 	
 	// FIXME the unlimited caching of files should probably be restricted:
 	// currently all loaded song data stays in memory as long as the page is opened
-	// maybe ist add some manual "reset"? 
+	// maybe just add some manual "reset"? 
 	setFile: function(filename, data) {
 		this._binaryFileMap[filename]= data;
 		this._isWaitingForFile= false;
 	}
-
 };
 
 
@@ -632,17 +635,17 @@ var ScriptNodePlayer = (function () {
 		this._currentPlaytime= 0;
 		this._currentTimeout= -1;		
 		
-		setGlobalWebAudioCtx();
+		if (!this.isAutoPlayCripple()) {
+			// original impl
+			setGlobalWebAudioCtx();
 
-		this._sampleRate = window._gPlayerAudioCtx.sampleRate;
-		this._correctSampleRate= this._sampleRate;			
-		this._backendAdapter.resetSampleRate(this._sampleRate, -1);
-
+			this._sampleRate = window._gPlayerAudioCtx.sampleRate;
+			this._correctSampleRate= this._sampleRate;			
+			this._backendAdapter.resetSampleRate(this._sampleRate, -1);
+		}
 			// general WebAudio stuff
 		this._bufferSource;
 		this._gainNode;
-		this._panNodeL;
-		this._panNodeR;
 		this._analyzerNode;
 		this._scriptNode;
 		this._freqByteData = 0; 
@@ -720,18 +723,11 @@ var ScriptNodePlayer = (function () {
 		* start audio playback
 		*/
 		play: function() {
-			this.initWebAudio();
-		
 			this._isPaused= false;
 
-			if (typeof this._bufferSource === 'undefined') {
-				this._bufferSource = window._gPlayerAudioCtx.createBufferSource();
-				if (!this._bufferSource.start) {
-				  this._bufferSource.start = this._bufferSource.noteOn;
-				  this._bufferSource.stop = this._bufferSource.noteOff;
-				}
-				this._bufferSource.start(0);		
-			}
+			// this function isn't invoked directly from some "user gesture" (but 
+			// indirectly from "onload" handler) so it might not work on braindead iOS shit
+			try { this._bufferSource.start(0); } catch(ignore) {}			
 		},		
 		/*
 		* pause audio playback
@@ -750,7 +746,7 @@ var ScriptNodePlayer = (function () {
 		*/
 		resume: function() {
 			if ((!this.isWaitingForFile()) && (!this._initInProgress) && this._isSongReady) {
-				this._isPaused= false;
+				this.play();
 			}
 		},
 				
@@ -817,7 +813,7 @@ var ScriptNodePlayer = (function () {
 			if (t<0) {
 				this._currentTimeout= -1;
 			} else {
-				this._currentTimeout= t/1000*this._sampleRate;
+				this._currentTimeout= t/1000*this._correctSampleRate;
 			}
 		},
 		/*
@@ -827,12 +823,12 @@ var ScriptNodePlayer = (function () {
 			if (this._currentTimeout < 0) {
 				return -1;
 			} else {
-				return Math.round(this._currentTimeout/this._sampleRate);
+				return Math.round(this._currentTimeout/this._correctSampleRate);
 			}
 		},
 
 		getCurrentPlaytime: function() {
-			return Math.round(this._currentPlaytime/this._sampleRate);
+			return Math.round(this._currentPlaytime/this._correctSampleRate);
 		},
 		
 // ******* access to frequency spectrum data (if enabled upon construction)
@@ -871,6 +867,8 @@ var ScriptNodePlayer = (function () {
 		* Loads from a JavaScript File object - e.g. used for 'drag & drop'.
 		*/
 		loadMusicFromTmpFile: function (file, options, onCompletion, onFail, onProgress) {
+			this.initByUserGesture();	// cannot be done from the callbacks below.. see iOS shit
+
 			var filename= file.name;	// format detection may depend on prefixes and postfixes..
 
 			this._fileReadyNotify= "";
@@ -902,11 +900,74 @@ var ScriptNodePlayer = (function () {
 			
 			reader.readAsArrayBuffer(file);
 		},
+		isAppleShit: function() {
+			return !!navigator.platform && /iPad|iPhone|iPod/.test(navigator.platform);
+		},
+		isAutoPlayCripple: function() {
+			return window.chrome || this.isAppleShit();
+		},
+		initByUserGesture: function() {
+			// try to setup as much as possible while it is "directly triggered"
+			// by "user gesture" (i.e. here).. seems POS iOS does not correctly
+			// recognize any async-indirections started from here.. bloody Apple idiots
+			if (typeof this._sampleRate == 'undefined') {
+				setGlobalWebAudioCtx();
+
+				this._sampleRate = window._gPlayerAudioCtx.sampleRate;
+				this._correctSampleRate= this._sampleRate;			
+				this._backendAdapter.resetSampleRate(this._sampleRate, -1);
+			} else {
+				// just in case: handle Chrome's new bullshit "autoplay policy"
+				if (window._gPlayerAudioCtx.state == "suspended") {
+					try {window._gPlayerAudioCtx.resume();} catch(e) {}					
+				}				
+			}
+
+			if (typeof this._bufferSource != 'undefined') {
+				try {
+					this._bufferSource.stop(0);
+				} catch(err) {}	// ignore for the benefit of Safari(OS X)
+			} else {
+				var ctx= window._gPlayerAudioCtx;
+				
+				if (this.isAppleShit()) this.iOSHack(ctx);
+				
+				this._analyzerNode = ctx.createAnalyser();
+				this._scriptNode= this.createScriptProcessor(ctx);
+				this._gainNode = ctx.createGain();	
 		
+				this._scriptNode.connect(this._gainNode);				
+
+				// optional add-on
+				if (typeof this._externalTicker !== 'undefined') {
+					var tickerScriptNode= this.createTickerScriptProcessor(ctx);
+					tickerScriptNode.connect(this._gainNode);
+				}
+				
+				// note: "panning" experiments using StereoPanner, ChannelSplitter / ChannelMerger
+				// led to bloody useless results: rather implement respective "panning"
+				// logic directly to get the exact effect that is needed here..
+				
+				if (this._spectrumEnabled) {
+					this._gainNode.connect(this._analyzerNode);
+					this._analyzerNode.connect(ctx.destination);
+				} else {
+					this._gainNode.connect(ctx.destination);
+					
+				}
+				this._bufferSource = ctx.createBufferSource();
+				if (!this._bufferSource.start) {
+					this._bufferSource.start = this._bufferSource.noteOn;
+					this._bufferSource.stop = this._bufferSource.noteOff;
+				}
+			}
+		},
 		/**
 		* Loads from an URL.
 		*/
 		loadMusicFromURL: function(url, options, onCompletion, onFail, onProgress) {
+			this.initByUserGesture();	// cannot be done from the callbacks below.. see iOS shit
+			
 			var fullFilename= this._backendAdapter.mapInternalFilename(options.basePath, this._basePath, url);
 
 			this._fileReadyNotify= "";
@@ -1068,48 +1129,23 @@ var ScriptNodePlayer = (function () {
 			return false;
 		},
 		getAudioContext: function() {
-			return window._gPlayerAudioCtx; // needs to be exposed due to Chrome's new bullshit "autoplay policy"
+			this.initByUserGesture();	// for backward compatibility
+			return window._gPlayerAudioCtx; // exposed due to Chrome's new bullshit "autoplay policy"
 		},
-		//init WebAudio node pipeline
-		initWebAudio: function() {
-			if (window.chrome) {
-				// handle Chrome's new bullshit "autoplay policy" (this methood is
-				// called before each "play" attempt)
-				if (window._gPlayerAudioCtx.state == "suspended") {
-					try {window._gPlayerAudioCtx.resume();} catch(e) {}					
-				}				
-			}
-			
-			
-			if (typeof this._bufferSource != 'undefined') {
-				try {
-					this._bufferSource.stop(0);
-				} catch(err) {/* ignore for the benefit of Safari(OS X) */}
-			} else {
-				var ctx= window._gPlayerAudioCtx;
-				this._analyzerNode = ctx.createAnalyser();
-				this._scriptNode= this.createScriptProcessor(ctx);
-				this._gainNode = ctx.createGain();	
-				
-				this._scriptNode.connect(this._gainNode);				
+		iOSHack: function(ctx) {
+			try {
+				var source = window._gPlayerAudioCtx.createBufferSource();
+				if (!source.start) {
+					source.start = source.noteOn;
+					source.stop = source.noteOff;
+				}
 
-				// optional add-on
-				if (typeof this._externalTicker !== 'undefined') {
-					var tickerScriptNode= this.createTickerScriptProcessor(ctx);
-					tickerScriptNode.connect(this._gainNode);
-				}
-				
-				// note: "panning" experiments using StereoPanner, ChannelSplitter / ChannelMerger
-				// led to bloody useless results: rather implement respective "panning"
-				// logic directly to get the exact effect that is needed here..
-				
-				if (this._spectrumEnabled) {
-					this._gainNode.connect(this._analyzerNode);
-					this._analyzerNode.connect(ctx.destination);
-				} else {
-					this._gainNode.connect(ctx.destination);
-				}
-			}
+				source.buffer = window._gPlayerAudioCtx.createBuffer(1, 1, 22050);	// empty buffer
+				source.connect(window._gPlayerAudioCtx.destination);
+
+				source.start(0);
+
+			} catch (ignore) {}			
 		},
 		updateSongInfo: function (fullFilename) {
 			this._songInfo= {};
@@ -1124,10 +1160,8 @@ var ScriptNodePlayer = (function () {
 				var data= new Uint8Array(arrayBuffer);
 				this._backendAdapter.registerFileData(pfn, data);	// in case the backend "needs" to retrieve the file by name 
 				
-				// FIXME regression test
 				var cacheFilename= this._backendAdapter.mapCacheFileName(fullFilename);
 				this.getCache().setFile(cacheFilename, data);			
-				// FIXME regression test
 				
 				var ret= this._backendAdapter.loadMusicData(this._sampleRate, pfn[0], pfn[1], data, options);
 
@@ -1145,13 +1179,16 @@ var ScriptNodePlayer = (function () {
 		resetSampleRate: function(sampleRate) {
 			// override the default (correct) sample rate to make playback faster/slower
 			this._backendAdapter.resetSampleRate(sampleRate, -1);
+			
+			if (sampleRate > 0) { this._sampleRate= sampleRate; }
+			
 			this.resetBuffer();
 		},
 		createScriptProcessor: function(audioCtx) {
 			// use the number of channels that the backend wants
 			var scriptNode = audioCtx.createScriptProcessor(SAMPLES_PER_BUFFER, 0, this._backendAdapter.getChannels());	
 			scriptNode.onaudioprocess = fetchSamples;
-		//	scriptNode.onaudioprocess = player.generateSamples.bind(player);	// doesn't work with dumbshit Chrome GC
+		//	scriptNode.onaudioprocess = window.player.genSamples.bind(window.player);	// doesn't work with dumbshit Chrome GC
 			return scriptNode;
 		},
 		createTickerScriptProcessor: function(audioCtx) {
@@ -1174,7 +1211,7 @@ var ScriptNodePlayer = (function () {
 			
 			for (i= 0; i<availableSpace; i++) {
 				output1[i+this._numberOfSamplesRendered]= 0;
-				if (this.isStereo()) { output2[i+this._numberOfSamplesRendered]= 0; }
+				if (typeof output2 !== 'undefined') { output2[i+this._numberOfSamplesRendered]= 0; }
 			}				
 			this._numberOfSamplesToRender = 0;
 			this._numberOfSamplesRendered = outSize;			
@@ -1297,19 +1334,21 @@ var ScriptNodePlayer = (function () {
 		tick: function(event) {
 			if (!this._isPaused) 
 			this._currentTick++;
-		},	
+		},
 		// called for 'onaudioprocess' to feed new batch of sample data
-		genSamples: function(event) {		
+		genSamples: function(event) {
+			var genStereo= this.isStereo() && event.outputBuffer.numberOfChannels>1;
+			
 			var output1 = event.outputBuffer.getChannelData(0);
 			var output2;
-			if (this.isStereo()) {
+			if (genStereo) {
 				output2 = event.outputBuffer.getChannelData(1);
 			}
 			if ((!this._isSongReady) || this.isWaitingForFile() || this._isPaused) {
 				var i;
 				for (i= 0; i<output1.length; i++) {
 					output1[i]= 0;
-					if (this.isStereo()) { output2[i]= 0; }
+					if (genStereo) { output2[i]= 0; }
 				}		
 			} else {
 				if (typeof this._externalTicker !== 'undefined') {
@@ -1326,7 +1365,7 @@ var ScriptNodePlayer = (function () {
 					
 						var status;		
 						if ((this._currentTimeout>0) && (this._currentPlaytime > this._currentTimeout)) {
-							this.trace("'song end' forced after "+ this._currentTimeout/this._sampleRate +" secs");
+							this.trace("'song end' forced after "+ this._currentTimeout/this._correctSampleRate +" secs");
 							status= 1;
 						} else {
 							status = this._backendAdapter.computeAudioSamples();
@@ -1377,14 +1416,14 @@ var ScriptNodePlayer = (function () {
 					}
 										
 					var resampleBuffer= this._backendAdapter.getResampleBuffer();
-					if (this.isStereo()) {
+					if (genStereo) {
 						this.copySamplesStereo(resampleBuffer, output1, output2, outSize);
 					} else {
 						this.copySamplesMono(resampleBuffer, output1, outSize);
 					}
 				}
-				
-				this._currentPlaytime+= outSize;	// keep track how long we are playing
+				// keep track how long we are playing: just filled one WebAudio buffer which will be played at 
+				this._currentPlaytime+= outSize * this._correctSampleRate/this._sampleRate;
 			}
 			if (typeof this._externalTicker !== 'undefined') {
 				this._externalTicker.calcTickData(output1, output2);
@@ -1483,7 +1522,7 @@ var ScriptNodePlayer = (function () {
 				if (typeof old._bufferSource != 'undefined') { 
 					try {
 						old._bufferSource.stop(0);
-					} catch(err) {/* ignore for the benefit of Safari(OS X) */}
+					} catch(err) {}	// ignore for the benefit of Safari(OS X)
 				}			
 				if (old._scriptNode) old._scriptNode.disconnect(0);
 				if (old._analyzerNode) old._analyzerNode.disconnect(0);
