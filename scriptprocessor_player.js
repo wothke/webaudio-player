@@ -8,11 +8,12 @@
 *
 * <p>AudioBackendAdapterBase: an abstract base class for specific backend (i.e. 'sample data producer') integration.
 *
-*	version 1.03e (with WASM support, cached filename translation & track switch bugfix, "internal filename" 
+*	version 1.03f+ (with WASM support, cached filename translation & track switch bugfix, "internal filename" 
 *				mapping, getVolume, setPanning, AudioContext get/resume, AbstractTicker revisited, bugfix for 
-*               duplicate events, improved "play after user gesture" support)
+*               duplicate events, improved "play after user gesture" support  + doubled sample buffer size),
+*               support for use of "alias" names for same file (see modland), added EmsHEAPF32BackendAdapter
 *
-* 	Copyright (C) 2018 Juergen Wothke
+* 	Copyright (C) 2019 Juergen Wothke
 *
 * Terms of Use: This software is licensed under a CC BY-NC-SA 
 * (http://creativecommons.org/licenses/by-nc-sa/4.0/).
@@ -147,7 +148,7 @@ AbstractTicker.prototype = {
 };
 
 
-var SAMPLES_PER_BUFFER = 8192; // allowed: buffer sizes: 256, 512, 1024, 2048, 4096, 8192, 16384
+var SAMPLES_PER_BUFFER = 16384; // allowed: buffer sizes: 256, 512, 1024, 2048, 4096, 8192, 16384
 
 		
 /*
@@ -409,7 +410,7 @@ AudioBackendAdapterBase.prototype = {
 	getResampledAudio: function(input, len) {
 		return this.getResampledFloats(input, len, this._sampleRate, this._inputSampleRate);
 	},
-	getResampledFloats: function(input, len, sampleRate, inputSampleRate) {	
+	getResampledFloats: function(input, len, sampleRate, inputSampleRate) {
 		var resampleLen;
 		if (sampleRate == inputSampleRate) {		
 			resampleLen= this.getCopiedAudio(input, len, this.readFloatSample.bind(this), this._resampleBuffer);
@@ -430,7 +431,7 @@ AudioBackendAdapterBase.prototype = {
 	
 	// utility
 	resampleToFloat: function(channels, channelId, inputPtr, len, funcReadFloat, resampleOutput, resampleLen) {
-		// Bresenham algorithm based resampling
+		// Bresenham (line drawing) algorithm based resampling
 		var x0= 0;
 		var y0= 0;
 		var x1= resampleLen - 0;
@@ -497,11 +498,14 @@ EmsHEAP16BackendAdapter = (function(){ var $this = function (backend, channels) 
 			}
 			var f;
 			try {
-				f= this.Module.FS_createDataFile(pathFilenameArray[0], pathFilenameArray[1], data, true, true);
+				if (typeof this.Module.FS_createDataFile == 'undefined') {
+					f= true;	// backend without FS (ignore for drag&drop files)
+				} else {
+					f= this.Module.FS_createDataFile(pathFilenameArray[0], pathFilenameArray[1], data, true, true);
 				
-				var p= ScriptNodePlayer.getInstance().trace("registerEmscriptenFileData: [" +
-						pathFilenameArray[0]+ "][" +pathFilenameArray[1]+ "] size: "+ data.length);
-
+					var p= ScriptNodePlayer.getInstance().trace("registerEmscriptenFileData: [" +
+						pathFilenameArray[0]+ "][" +pathFilenameArray[1]+ "] size: "+ data.length);					
+				}
 			} catch(err) {
 				// file may already exist, e.g. drag/dropped again.. just keep entry
 				
@@ -531,6 +535,44 @@ EmsHEAP16BackendAdapter = (function(){ var $this = function (backend, channels) 
 				if ((this.Module.HEAP16[buffer+i] != nl) || (this.Module.HEAP16[buffer+i+1] == nr)) {
 					console.log("X");
 				}*/
+			}	
+		}
+	});	return $this; })();
+	
+/*
+* Emscripten based backends that produce 32-bit float sample data.
+*
+* NOTE: This impl adds handling for asynchronously initialized 'backends', i.e.
+*       the 'backend' that is passed in, may not yet be usable (see WebAssebly based impls: 
+*       here a respective "onRuntimeInitialized" event will eventually originate from the 'backend'). 
+*       The 'backend' allows to register a "adapterCallback" hook to propagate the event - which is
+*       used here. The player typically observes the backend-adapter and when the adapter state changes, a 
+*       "notifyAdapterReady" is triggered so that the player is notified of the change.
+*/
+EmsHEAPF32BackendAdapter = (function(){ var $this = function (backend, channels) { 
+		$this.base.call(this, backend, channels);
+		
+		this._bytesPerSample= 4;
+	}; 
+	extend(EmsHEAP16BackendAdapter, $this, {
+		readFloatSample: function(buffer, idx) {
+			return (this.Module.HEAPF32[buffer+idx]);
+		},
+		// certain songs use an unfavorable L/R separation - e.g. bass on one channel - that is 
+		// not nice to listen to. This "panning" impl allows to "mono"-ify those songs.. (this._pan=1 
+		// creates mono)
+		applyPanning: function(buffer, len, pan) {
+			pan=  pan * 256.0 / 2.0;
+			var i, l, r, m;
+			for (i = 0; i < len*2; i+=2) {
+				l = this.Module.HEAPF32[buffer+i];
+				r = this.Module.HEAPF32[buffer+i+1];
+				m = (r - l) * pan;
+				
+				var nl= ((l *256) + m) /256;
+				var nr= ((r *256) - m) /256;
+				this.Module.HEAPF32[buffer+i] = nl;
+				this.Module.HEAPF32[buffer+i+1] = nr;
 			}	
 		}
 	});	return $this; })();	
@@ -590,11 +632,12 @@ var ScriptNodePlayer = (function () {
 	/*
 	* @param externalTicker must be a subclass of AbstractTicker
 	*/
-	PlayerImpl = function(backendAdapter, basePath, requiredFiles, spectrumEnabled, onPlayerReady, onTrackReadyToPlay, onTrackEnd, onUpdate, externalTicker) {
+	PlayerImpl = function(backendAdapter, basePath, requiredFiles, spectrumEnabled, onPlayerReady, onTrackReadyToPlay, onTrackEnd, onUpdate, externalTicker, bufferSize) {
 		if(typeof backendAdapter === 'undefined')		{ alert("fatal error: backendAdapter not specified"); }
 		if(typeof onPlayerReady === 'undefined')		{ alert("fatal error: onPlayerReady not specified"); }
 		if(typeof onTrackReadyToPlay === 'undefined')	{ alert("fatal error: onTrackReadyToPlay not specified"); }
 		if(typeof onTrackEnd === 'undefined')			{ alert("fatal error: onTrackEnd not specified"); }
+		if(typeof bufferSize !== 'undefined')			{ window.SAMPLES_PER_BUFFER= bufferSize; }
 
 		if (backendAdapter.getChannels() >2) 			{ alert("fatal error: only 1 or 2 output channels supported"); }
 		this._backendAdapter= backendAdapter;
@@ -828,7 +871,8 @@ var ScriptNodePlayer = (function () {
 		},
 
 		getCurrentPlaytime: function() {
-			return Math.round(this._currentPlaytime/this._correctSampleRate);
+//			return Math.round(this._currentPlaytime/this._correctSampleRate);
+			return this._currentPlaytime/this._correctSampleRate;	// let user do the rounding in needed
 		},
 		
 // ******* access to frequency spectrum data (if enabled upon construction)
@@ -1118,6 +1162,9 @@ var ScriptNodePlayer = (function () {
 			var data= this.getCache().getFile(cacheFilename);
 			
 			if (typeof data != 'undefined') {				
+				
+				this.trace("loadMusicDataFromCache found cached file using name: "+ cacheFilename);
+				
 				if(!this.prepareTrackForPlayback(fullFilename, data, options)) {
 					if (!this.isWaitingForFile()) {
 						onFail();
@@ -1125,6 +1172,8 @@ var ScriptNodePlayer = (function () {
 					}
 				}
 				return true;
+			} else {
+				this.trace("loadMusicDataFromCache FAILED to find cached file using name: "+ cacheFilename);
 			}
 			return false;
 		},
@@ -1231,6 +1280,8 @@ var ScriptNodePlayer = (function () {
 		fileRequestCallback: function (name) {
 			var fullFilename = this._backendAdapter.mapBackendFilename(name);	
 			
+			this.trace("fileRequestCallback backend name: "+ name + " > FS name: "+fullFilename );
+
 			return this.preloadFile(fullFilename, function() {
 								this.initIfNeeded(this.lastUsedFilename, this.lastUsedData, this.lastUsedOptions);
 						}.bind(this), false);	
@@ -1278,10 +1329,20 @@ var ScriptNodePlayer = (function () {
 				if (data == 0) {
 					retVal= 1;
 					this.trace("error: preloadFile could not get cached: "+ fullFilename);
+				} else {
+					this.trace("preloadFile found cached file using name: "+ cacheFilename);
+					
+					// but in cases were alias names as used for the same file (see modland shit)
+					// the file may NOT yet have been registered in the FS
+						// setup data in our virtual FS (the next access should then be OK)
+						var pfn= this._backendAdapter.getPathAndFilename(fullFilename);
+						var f= this._backendAdapter.registerFileData(pfn, data);
 				}
 				if(notifyOnCached)
 					onLoadedHandler();	// trigger next in chain	  needed for preload / but hurts "backend callback"
 				return retVal;
+			} else {
+				this.trace("preloadFile FAILED to find cached file using name: "+ cacheFilename);
 			}
 
 			// backend will be stuck without this file and we better make 
@@ -1308,6 +1369,8 @@ var ScriptNodePlayer = (function () {
 						var data= new Uint8Array(arrayBuffer);
 						var f= this._backendAdapter.registerFileData(pfn, data);
 
+						this.trace("preloadFile cached file using name: "+ cacheFilename);
+						
 						this.getCache().setFile(cacheFilename, data);			
 					}
 					if(!delete this.getCache().getPendingMap()[cacheFilename]) {
@@ -1511,8 +1574,11 @@ var ScriptNodePlayer = (function () {
 	};
 
     return {
+		/*
+			@param bufferSize size of the used sample buffer; allowed: 256, 512, 1024, 2048, 4096, 8192, 16384 (default)
+		*/
 	    createInstance: function(backendAdapter, basePath, requiredFiles, enableSpectrum,
-								onPlayerReady, onTrackReadyToPlay, onTrackEnd, doOnUpdate, externalTicker) {
+								onPlayerReady, onTrackReadyToPlay, onTrackEnd, doOnUpdate, externalTicker, bufferSize) {
 					
 			var trace= false;
 			if (typeof window.player != 'undefined' ) {			// stop existing pipeline
@@ -1524,14 +1590,15 @@ var ScriptNodePlayer = (function () {
 						old._bufferSource.stop(0);
 					} catch(err) {}	// ignore for the benefit of Safari(OS X)
 				}			
-				if (old._scriptNode) old._scriptNode.disconnect(0);
+				if (old._scriptNode) old._scriptNode.disconnect(0);		// XXX FIXME why 0??? 
 				if (old._analyzerNode) old._analyzerNode.disconnect(0);
 				if (old._gainNode) old._gainNode.disconnect(0);
 				
 				trace= old._traceSwitch;
 			}
+			// FIXME ugly side-effect: internally the below constructor sets window.player to 'p' 
 			var p = new PlayerImpl(backendAdapter, basePath, requiredFiles, enableSpectrum,
-								onPlayerReady, onTrackReadyToPlay, onTrackEnd, doOnUpdate, externalTicker);
+								onPlayerReady, onTrackReadyToPlay, onTrackEnd, doOnUpdate, externalTicker, bufferSize);
 			p._traceSwitch= trace;
 		},
         getInstance: function () {
