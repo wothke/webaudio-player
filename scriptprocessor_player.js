@@ -8,10 +8,12 @@
 *
 * <p>AudioBackendAdapterBase: an abstract base class for specific backend (i.e. 'sample data producer') integration.
 *
-*	version 1.03f+ (with WASM support, cached filename translation & track switch bugfix, "internal filename" 
+*	version 1.1.2 (with WASM support, cached filename translation & track switch bugfix, "internal filename" 
 *				mapping, getVolume, setPanning, AudioContext get/resume, AbstractTicker revisited, bugfix for 
 *               duplicate events, improved "play after user gesture" support  + doubled sample buffer size),
-*               support for use of "alias" names for same file (see modland), added EmsHEAPF32BackendAdapter
+*               support for use of "alias" names for same file (see modland), added EmsHEAPF32BackendAdapter,
+*               added silence detection, extended copyTickerData signature, added JCH's "choppy ticker" fix,
+*				added setSilenceTimeout()
 *
 * 	Copyright (C) 2019 Juergen Wothke
 *
@@ -139,7 +141,7 @@ AbstractTicker.prototype = {
 	/*
 	* Copies data from the resampled input buffers to the "WebAudio audio buffer" sized output.
 	*/
-	copyTickerData: function(outBufferIdx, inBufferIdx) {},
+	copyTickerData: function(outBufferIdx, inBufferIdx, backendAdapter) {},
 	/*
 	* Invoked after audio buffer content has been generated.
 	* @deprecated Legacy API used in early VU meter experiments
@@ -666,6 +668,8 @@ var ScriptNodePlayer = (function () {
 	    this._externalTicker = externalTicker;
 		this._currentTick= 0;
 		
+		this._silenceStarttime= -1;
+		this._silenceTimeout= 5; // by default 5 secs of silence will end a song 
 		
 		// audio buffer handling
 		this._sourceBuffer;
@@ -751,6 +755,14 @@ var ScriptNodePlayer = (function () {
 		*/
 		isReady: function() {
 			return this._isPlayerReady;	
+		},
+
+		/**
+		* Change the default 5sec timeout  (0 means no timeout).
+		*/
+		setSilenceTimeout: function(silenceTimeout) {
+			// usecase: user may temporarrily turn off output (see DeepSID) and player should not end song 
+			this._silenceTimeout= silenceTimeout;	
 		},
 	
 		/**
@@ -1138,6 +1150,8 @@ var ScriptNodePlayer = (function () {
 						// duplicate we already notified about.. probably some retry due to missing load-on-demand files
 						this.play();	// user had already expressed his wish to play
 					} else {
+						this._silenceStarttime= -1;	// reset silence detection
+
 						this._onTrackReadyToPlay();
 					}
 					this._fileReadyNotify= fullFilename;	
@@ -1487,64 +1501,102 @@ var ScriptNodePlayer = (function () {
 				}
 				// keep track how long we are playing: just filled one WebAudio buffer which will be played at 
 				this._currentPlaytime+= outSize * this._correctSampleRate/this._sampleRate;
+
+				// silence detection at end of song
+				if ((this._silenceStarttime > 0) && ((this._currentPlaytime - this._silenceStarttime) >= this._silenceTimeout*this._correctSampleRate ) && (this._silenceTimeout >0)) {
+					this._isPaused= true;	// stop playback (or this will retrigger again and again before new song is started)
+					if (this._onTrackEnd) {
+						this._onTrackEnd();
+					}
+				}
 			}
 			if (typeof this._externalTicker !== 'undefined') {
 				this._externalTicker.calcTickData(output1, output2);
 				this._currentTick= 0;
 			}
 		},
+		detectSilence: function(s) {
+			if (this._silenceStarttime == 0) {	// i.e. song has been playing
+				if (s == 0) {	// silence detected
+					this._silenceStarttime= this._currentPlaytime;
+				}
+			} else if (s > 0) {	// i.e. false alarm or very start of playback
+				this._silenceStarttime= 0;
+			}
+		},
 		copySamplesStereo: function(resampleBuffer, output1, output2, outSize) {
 			var i;
+			var s= 0, l= 0, r=  0;
+			var abs= Math.abs;
 			if (this._numberOfSamplesRendered + this._numberOfSamplesToRender > outSize) {
 				var availableSpace = outSize-this._numberOfSamplesRendered;
-				
+								
 				for (i= 0; i<availableSpace; i++) {
 					if (typeof this._externalTicker !== 'undefined') {
-						this._externalTicker.copyTickerData(i+this._numberOfSamplesRendered, (this._sourceBufferIdx>>1));
-					}					
-					output1[i+this._numberOfSamplesRendered]= resampleBuffer[this._sourceBufferIdx++];
-					output2[i+this._numberOfSamplesRendered]= resampleBuffer[this._sourceBufferIdx++];
-				}				
+						this._externalTicker.copyTickerData(i+this._numberOfSamplesRendered, (this._sourceBufferIdx>>1), this._backendAdapter);
+					}
+					l= resampleBuffer[this._sourceBufferIdx++];
+					r= resampleBuffer[this._sourceBufferIdx++];
+					
+					output1[i+this._numberOfSamplesRendered]= l;
+					output2[i+this._numberOfSamplesRendered]= r;
+					
+					s+= abs(l) + abs(r);
+				}
+				
 				this._numberOfSamplesToRender -= availableSpace;
 				this._numberOfSamplesRendered = outSize;
 			} else {
 				for (i= 0; i<this._numberOfSamplesToRender; i++) {
 					if (typeof this._externalTicker !== 'undefined') {
-						this._externalTicker.copyTickerData(i+this._numberOfSamplesRendered, (this._sourceBufferIdx>>1));
-					}					
-					output1[i+this._numberOfSamplesRendered]= resampleBuffer[this._sourceBufferIdx++];
-					output2[i+this._numberOfSamplesRendered]= resampleBuffer[this._sourceBufferIdx++];
+						this._externalTicker.copyTickerData(i+this._numberOfSamplesRendered, (this._sourceBufferIdx>>1), this._backendAdapter);
+					}
+					l= resampleBuffer[this._sourceBufferIdx++];
+					r= resampleBuffer[this._sourceBufferIdx++];
+		
+					output1[i+this._numberOfSamplesRendered]= l;
+					output2[i+this._numberOfSamplesRendered]= r;
+
+					s+= abs(l) + abs(r);
 				}						
 				this._numberOfSamplesRendered += this._numberOfSamplesToRender;
-				this._numberOfSamplesToRender = 0;
-			} 	
+				this._numberOfSamplesToRender = 0;	
+			}
+			this.detectSilence(s);
 		},
 		copySamplesMono: function(resampleBuffer, output1, outSize) {
 			var i;
+			var s= 0, o=  0;
+			var abs= Math.abs;
 			if (this._numberOfSamplesRendered + this._numberOfSamplesToRender > outSize) {
 				var availableSpace = outSize-this._numberOfSamplesRendered;
 				
 				for (i= 0; i<availableSpace; i++) {
 					if (typeof this._externalTicker !== 'undefined') {
-						this._externalTicker.copyTickerData(i+this._numberOfSamplesRendered, this._sourceBufferIdx);
-					}					
-					output1[i+this._numberOfSamplesRendered]= resampleBuffer[this._sourceBufferIdx++];
+						this._externalTicker.copyTickerData(i+this._numberOfSamplesRendered, this._sourceBufferIdx, this._backendAdapter);
+					}
+					o= resampleBuffer[this._sourceBufferIdx++];
+					output1[i+this._numberOfSamplesRendered]= o;
+					
+					s+= abs(o);
 				}				
 				this._numberOfSamplesToRender -= availableSpace;
 				this._numberOfSamplesRendered = outSize;
 			} else {
 				for (i= 0; i<this._numberOfSamplesToRender; i++) {
 					if (typeof this._externalTicker !== 'undefined') {
-						this._externalTicker.copyTickerData(i+this._numberOfSamplesRendered, this._sourceBufferIdx);
-					}					
-					output1[i+this._numberOfSamplesRendered]= resampleBuffer[this._sourceBufferIdx++];
+						this._externalTicker.copyTickerData(i+this._numberOfSamplesRendered, this._sourceBufferIdx, this._backendAdapter);
+					}
+					o= resampleBuffer[this._sourceBufferIdx++];
+					output1[i+this._numberOfSamplesRendered]= o;
+					
+					s+= abs(o);
 				}						
 				this._numberOfSamplesRendered += this._numberOfSamplesToRender;
 				this._numberOfSamplesToRender = 0;
-			} 	
+			}
+			this.detectSilence(s);
 		},
-		
-		
 		
 		// Avoid the async trial&error loading (if available) for those files that 
 		// we already know we'll be needing
@@ -1580,6 +1632,23 @@ var ScriptNodePlayer = (function () {
 	    createInstance: function(backendAdapter, basePath, requiredFiles, enableSpectrum,
 								onPlayerReady, onTrackReadyToPlay, onTrackEnd, doOnUpdate, externalTicker, bufferSize) {
 					
+			if ((externalTicker != null) &&  (typeof player !== "undefined")) {
+				// JCH's hack: The audio context must be recreated to avoid choppy updating in the oscilloscope voices
+				_gPlayerAudioCtx.close();
+				_gPlayerAudioCtx.ctx = null;
+				try {
+					if("AudioContext" in window) {
+						_gPlayerAudioCtx = new AudioContext();
+					} else if('webkitAudioContext' in window) {
+						_gPlayerAudioCtx = new webkitAudioContext(); // Legacy
+					} else {
+						alert(errText + e);
+					}
+				} catch(e) {
+					alert(errText + e);
+				}
+			}
+			
 			var trace= false;
 			if (typeof window.player != 'undefined' ) {			// stop existing pipeline
 				var old= window.player;
